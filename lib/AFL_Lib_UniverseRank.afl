@@ -1,0 +1,59 @@
+// ============================================================================
+// LIB: UNIVERSE RANK GATE — daily Top-N by cross-sectional score (two-step)
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 2 library extraction).
+// Mirrors the live launcher fan-out. Two-step by design:
+//   Step 1 (populate): run the strategy as a SCAN or EXPLORATION over the
+//     universe + date range. Each symbol writes its daily score static var
+//     and (re)generates the cross-sectional ranks; the last symbol's call
+//     sees every symbol, so after the run completes the ranks are correct.
+//   Step 2 (gate): run the BACKTEST. It reads the ranks left by Step 1 and (in
+//     the entry loop) blocks entries for any symbol outside that day's Top-N.
+// StaticVarGenerateRanks assigns rank 1 to the HIGHEST score (verified).
+// Inert live: populate fires only on Scan/Explore, the gate only on Backtest;
+// a live auto-trade chart is an Indicator, so neither path runs there.
+//
+// REQUIRES (defined by the including strategy BEFORE #include):
+//   StrategyCode  (string)  StaticVar namespace, e.g. "ORB"
+//   UniScore      (array)   cross-sectional score (higher = better)
+//   UniCandidate  (array)   candidate mask (rankable set)
+//   UniLockBar    (array)   the once-per-day snapshot bar (score freeze)
+//   UniSnapValid  (array)   bars on which the frozen snapshot is meaningful
+//   EnableUniverseRank      (param toggle)
+//
+// PROVIDES:
+//   UniRank        (array)  this symbol's daily rank (1 = best; 1e9 = missing)
+//   UniRanksReady  (bool)   Step 1 has run this session (else gate fail-closed)
+//   UniRankGateOn  (bool)   True only under Backtest action
+//
+// Entry-loop usage (unchanged from the monolith):
+//   if (UniRankGateOn) {
+//       if (NOT UniRanksReady) continue;          // scan skipped -> block all
+//       if (UniRank[i] > UniverseTopN) continue;  // outside today's Top-N
+//   }
+// ============================================================================
+
+_uniAct = Status("action");
+
+// Freeze each symbol's score + candidacy at the lock bar so ranking uses ONE
+// value per day -- exactly like the Explore's ValueWhen(lastbarinrange)
+// snapshot. Without this, intraday drift (e.g. ATR-normalized metrics)
+// reshuffles the Top-N membership across the day and far MORE than
+// UniverseTopN symbols slip through.
+QSsnap    = ValueWhen(UniLockBar, UniScore);
+CandSnap  = ValueWhen(UniLockBar, UniCandidate);
+
+if (EnableUniverseRank AND (_uniAct == actionScan OR _uniAct == actionExplore))
+{
+    // Frozen daily snapshot; -1e9 sentinel keeps non-candidates out of the Top-N.
+    StaticVarSet(StrategyCode + "uniqs_" + Name(), IIf(UniSnapValid AND CandSnap, QSsnap, -1e9), False);
+    StaticVarGenerateRanks(StrategyCode + "unirank", StrategyCode + "uniqs_", 0, 1224);
+    StaticVarSet(StrategyCode + "uniReady", 1, False);
+}
+
+// Rank array for THIS symbol (left by the Step 1 scan). "+ 0 * C" forces a
+// full-length array even when the static var is missing, so the per-bar index
+// in the entry loop is always safe; missing -> 1e9 (sorts outside any Top-N).
+UniRank       = Nz(StaticVarGet(StrategyCode + "unirank" + StrategyCode + "uniqs_" + Name()), 1e9) + 0 * C;
+UniRanksReady = Nz(StaticVarGet(StrategyCode + "uniReady")) == 1;
+UniRankGateOn = EnableUniverseRank AND (_uniAct == actionBacktest);

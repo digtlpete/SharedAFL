@@ -1,0 +1,117 @@
+// ============================================================================
+// LIB: RTH VWAP + STANDARD DEVIATION BANDS + PRIOR-DAY REFERENCES
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
+// All VWAP-based filters use RTH VWAP only — no extended-session / pre-market
+// VWAP.
+//
+// REQUIRES (from AFL_Lib_SessionTime.afl):
+//   NewDay, RthOpen, IsRTH
+//
+// PROVIDES (globals):
+//   RthVwap, RthVwapU1SD, RthVwapL1SD, RthVwapU2SD, RthVwapL2SD
+//   PrevDayU1SD, PrevDayL1SD, PrevDayRthHigh, PrevDayRthLow, PrevDayRthClose
+// ============================================================================
+
+RthVwap       = Null;
+RthVwapU1SD   = Null;
+RthVwapL1SD   = Null;
+RthVwapU2SD   = Null;
+RthVwapL2SD   = Null;
+
+rthCumTPV     = 0;
+rthCumVol     = 0;
+rthCumTPV2    = 0;  // For variance: sum of (price^2 * volume)
+
+for (i = 0; i < BarCount; i++)
+{
+    if (NewDay[i] OR RthOpen[i])
+    {
+        rthCumTPV  = 0;
+        rthCumVol  = 0;
+        rthCumTPV2 = 0;
+    }
+
+    if (IsRTH[i])
+    {
+        tp          = (H[i] + L[i] + C[i]) / 3;
+        rthCumTPV   = rthCumTPV + tp * V[i];
+        rthCumVol   = rthCumVol + V[i];
+        rthCumTPV2  = rthCumTPV2 + tp * tp * V[i];
+
+        if (rthCumVol > 0)
+        {
+            vw            = rthCumTPV / rthCumVol;
+            variance      = (rthCumTPV2 / rthCumVol) - vw * vw;
+            sd            = sqrt(Max(variance, 0));
+            RthVwap[i]    = vw;
+            RthVwapU1SD[i] = vw + sd;
+            RthVwapL1SD[i] = vw - sd;
+            RthVwapU2SD[i] = vw + 2 * sd;
+            RthVwapL2SD[i] = vw - 2 * sd;
+        }
+    }
+}
+
+// ============================================================================
+// PREVIOUS DAY RTH VWAP 1SD BANDS (for Value Area filter)
+// Store the final RTH VWAP bands from the prior day
+// ============================================================================
+PrevDayU1SD = Null;
+PrevDayL1SD = Null;
+PrevDayRthHigh  = Null;
+PrevDayRthLow   = Null;
+PrevDayRthClose = Null;
+
+prevU1SD = 0;
+prevL1SD = 0;
+dayEndU1SD = 0;
+dayEndL1SD = 0;
+prevRthHigh = 0;
+prevRthLow  = 0;
+dayRthHigh  = 0;
+dayRthLow   = 0;
+prevRthClose = 0;
+dayRthClose  = 0;
+
+for (i = 0; i < BarCount; i++)
+{
+    // NewDay MUST run before IsRTH on the same bar.  Otherwise the first
+    // RTH bar of a new session updates dayRthHigh/Low while they still hold
+    // the *previous* calendar day's running extrema — e.g. Oct 14's opening
+    // low gets merged into Oct 13's low before the snapshot, so PrevDayRthLow
+    // becomes too low and GapOpenPct falsely reads 0 (open "inside" a bogus
+    // widened range).  Same ordering issue for PrevDay VWAP 1SD carry.
+    if (NewDay[i])
+    {
+        prevU1SD = dayEndU1SD;
+        prevL1SD = dayEndL1SD;
+        dayEndU1SD = 0;
+        dayEndL1SD = 0;
+        prevRthHigh = dayRthHigh;
+        prevRthLow  = dayRthLow;
+        dayRthHigh  = 0;
+        dayRthLow   = 0;
+        prevRthClose = dayRthClose;
+        dayRthClose  = 0;
+    }
+
+    if (IsRTH[i])
+    {
+        if (!IsNull(RthVwapU1SD[i]))
+        {
+            dayEndU1SD = RthVwapU1SD[i];
+            dayEndL1SD = RthVwapL1SD[i];
+        }
+
+        if (dayRthHigh == 0 OR H[i] > dayRthHigh) dayRthHigh = H[i];
+        if (dayRthLow  == 0 OR L[i] < dayRthLow)  dayRthLow  = L[i];
+        dayRthClose = C[i];
+    }
+
+    PrevDayU1SD[i] = prevU1SD;
+    PrevDayL1SD[i] = prevL1SD;
+    PrevDayRthHigh[i]  = prevRthHigh;
+    PrevDayRthLow[i]   = prevRthLow;
+    PrevDayRthClose[i] = prevRthClose;
+}

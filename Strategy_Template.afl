@@ -1,0 +1,118 @@
+// ============================================================================
+// STRATEGY TEMPLATE — thin harness over SharedAFL plumbing
+// ----------------------------------------------------------------------------
+// Copy this file, rename StrategyCode, and replace the SIGNAL section.
+// Everything else (session time, VWAP bands, daily context, universe rank,
+// position sizing, realized P/L, chart overlays, IB execution) comes from
+// SharedAFL\lib\ and is regression-proven against the ORB golden baseline.
+//
+// Canonical libs live at:
+//   g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\
+//
+// Workflow for a new idea:
+//   1. Copy to MyIdea_Strategy.afl; set StrategyCode (unique — it namespaces
+//      all static vars, so two strategies can coexist in one AmiBroker).
+//   2. Write the SIGNAL section: set Buy/Short/SellPrice arrays (or a loop),
+//      and feed the adapters (UniScore/UniLockBar/UniSnapValid, sizing calls).
+//   3. Backtest via the regression harness (from an ORB-style tools/ tree):
+//        python tools/make_regression_apx.py MyIdea_Strategy.afl automation/Backtest_MyIdea.apx
+//        python tools/make_cleanup_apx.py
+//        python tools/run_regression.py results/MyIdea.csv automation/Backtest_MyIdea.apx
+//   4. For live IB execution, satisfy the signal contract documented in
+//      SharedAFL\lib\AFL_Lib_IBEngine.afl and include it (optional; omit while testing).
+// ============================================================================
+
+StrategyCode = "TPL";   // CHANGE ME — unique static-var namespace per strategy
+
+// ============================================================================
+// PARAMETERS — the minimum set the libs require
+// ============================================================================
+_SECTION_BEGIN("Session Times & Time Filters");
+RthStartHour        = Param("RTH Start Hour", 7, 0, 23, 1);
+RthStartMin         = Param("RTH Start Min", 30, 0, 59, 1);
+RthEndHour          = Param("RTH End Hour", 14, 0, 23, 1);
+RthEndMin           = Param("RTH End Min", 0, 0, 59, 1);
+UseTimeFilter       = ParamToggle("Use Time Filter", "No|Yes", 0);
+TimeFilterStartHour = Param("Time Filter Start Hour", 7, 0, 23, 1);
+TimeFilterStartMin  = Param("Time Filter Start Min", 30, 0, 59, 1);
+TimeFilterEndHour   = Param("Time Filter End Hour", 10, 0, 23, 1);
+TimeFilterEndMin    = Param("Time Filter End Min", 30, 0, 59, 1);
+UseBlackout         = ParamToggle("Use Blackout Window", "No|Yes", 0);
+BlackoutStartHour   = Param("Blackout Start Hour", 8, 0, 23, 1);
+BlackoutStartMin    = Param("Blackout Start Min", 30, 0, 59, 1);
+BlackoutEndHour     = Param("Blackout End Hour", 9, 0, 23, 1);
+BlackoutEndMin      = Param("Blackout End Min", 0, 0, 59, 1);
+ExitAtRthEnd        = ParamToggle("Exit At Set Time", "No|Yes", 1);
+ExitHour            = Param("Exit Hour", 13, 0, 23, 1);
+ExitMinute          = Param("Exit Minute", 55, 0, 59, 1);
+_SECTION_END();
+
+_SECTION_BEGIN("Position Sizing");
+UsePercentRisk      = ParamToggle("Use % Risk Sizing", "No|Yes", 1);
+RiskPercent         = Param("Risk % per Trade", 1.0, 0.1, 10.0, 0.1);
+MaxShares           = Param("Max Shares", 10000, 1, 100000, 1);
+FixedShares         = Param("Fixed Shares", 100, 1, 100000, 1);
+OverrideBalance     = Param("Override Account Balance ($0=actual)", 30000, 0, 10000000, 1000);
+MaxPctOfEquity      = Param("Max Position % of Equity", 25, 10, 100, 5);
+SkipIfRiskExceeded  = ParamToggle("Skip if 1 Share > Risk%", "No|Yes", 0);
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_PositionSizing.afl"
+_SECTION_END();
+
+_SECTION_BEGIN("Universe & Context");
+AdvLookback         = Param("ADV Lookback (days)", 20, 5, 252, 1);
+EnableUniverseRank  = ParamToggle("Universe Rank Gate (backtest)", "No|Yes", 1);
+UniverseTopN        = Param("Universe Top-N (rank cut)", 15, 1, 200, 1);
+_SECTION_END();
+
+// ============================================================================
+// PLUMBING — session time, VWAP bands, daily context
+// ============================================================================
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_SessionTime.afl"
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_VwapBands.afl"
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_DailyContext.afl"
+
+// ============================================================================
+// SIGNAL — REPLACE THIS SECTION WITH YOUR IDEA
+// ----------------------------------------------------------------------------
+// Placeholder signal: long when price reclaims RTH VWAP during RTH, flat at
+// the timed exit. Demonstrates the plumbing wiring; not a real edge.
+// ============================================================================
+Buy   = IsRTH AND WithinTimeFilter AND NOT InBlackout
+        AND Cross(C, RthVwap);
+Sell  = PastExitTime OR Cross(RthVwap, C);
+Short = Cover = 0;
+
+// Sizing. NOTE: SizingRiskQty()/SizingFinalQty() are SCALAR functions for
+// loop-based strategies (they use if() internally) — call them per-bar inside
+// your entry loop, as ORB_Strategy.afl does. For array-style signals like
+// this placeholder, express the same policy with array math:
+_stopDist  = 0.01 * C;   // placeholder: 1% stop distance
+_acctBal   = IIf(OverrideBalance > 0, OverrideBalance, 100000);
+_riskQty   = floor((_acctBal * RiskPercent / 100) / _stopDist);
+_equityCap = Max(1, floor((_acctBal * MaxPctOfEquity / 100) / C));
+_qty       = Min(Max(1, Min(_riskQty, MaxShares)), _equityCap);
+SetPositionSize(_qty * C, spsValue);
+ApplyStop(stopTypeLoss, stopModePoint, _stopDist, True);
+
+// Daily score used for the cross-sectional Top-N gate (higher = better).
+QualityScore = log(1 + AvgDailyRthVol);
+
+// ============================================================================
+// UNIVERSE RANK GATE — daily Top-N across the watchlist (two-step: run a
+// SCAN to populate, single-symbol GenerateRanks pass, then BACKTEST).
+// tools/run_regression.py drives that protocol automatically.
+// ============================================================================
+UniScore     = QualityScore;
+UniLockBar   = RthOpen;          // freeze the daily score at the open
+UniSnapValid = IsRTH;
+UniCandidate = AvgDailyRthVol > 0;
+#include "g:\OneDrive\01_TRADING\AFL_DEV\SharedAFL\lib\AFL_Lib_UniverseRank.afl"
+if (UniRankGateOn)
+    Buy = Buy AND UniRanksReady AND UniRank <= UniverseTopN;
+
+// ============================================================================
+// DISPLAY
+// ============================================================================
+Plot(C, "Close", colorDefault, styleCandle);
+Plot(RthVwap, "RTH VWAP", colorYellow, styleLine | styleNoRescale);
+_N(Title = StrFormat("{{NAME}} " + StrategyCode + " {{Interval}} {{DATE}} C=%g", C));

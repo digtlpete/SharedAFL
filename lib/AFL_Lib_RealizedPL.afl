@@ -1,0 +1,108 @@
+// ============================================================================
+// LIB: REALIZED P/L via StaticVars (frozen at exit, survives bar shifts)
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
+// Each closed trade writes its P/L to a StaticVar keyed by exit DateTime.
+// On each refresh, we scan the signal arrays to find exits and look up the
+// frozen P/L.  If the StaticVar doesn't exist yet (first time this exit is
+// seen), we compute and store it.  This makes the display immune to bar-index
+// shifts from data backfill.
+//
+// REQUIRES:
+//   StrategyCode (string), RthOpen, dt, dn   (session/time globals)
+//   Buy, Sell, Short, Cover, BuyPrice, SellPrice, ShortPrice, CoverPrice,
+//   PositionSize                              (signal arrays)
+//   DebugTrace, DebugVerbose                  (params)
+//
+// PROVIDES:
+//   RealPL (array), _svPfx (StaticVar prefix reused by chart overlay)
+// ============================================================================
+
+// NOTE: StrategyCode == "ORB" makes this prefix byte-identical to the
+// original hardcoded "ORB_PL_" keys, so existing session StaticVars carry over.
+_svPfx = StrategyCode + "_PL_" + Name() + "_";
+RealPL = 0;
+_rlPL  = 0;
+_rlDir = 0;
+_rlEntry = 0;
+_rlQty   = 0;
+
+for (i = 1; i < BarCount; i++)
+{
+    if (RthOpen[i])
+    {
+        if (DebugVerbose)
+            _TRACE("$$$ RthOpen DETECTED bar=" + NumToStr(i, 1.0) +
+                   " dt=" + DateTimeToStr(dt[i]) +
+                   " curPL=" + NumToStr(_rlPL, 1.2) +
+                   " IsRTH=" + NumToStr(IsRTH[i], 1.0) +
+                   " prevIsRTH=" + NumToStr(IsRTH[Max(0, i-1)], 1.0));
+        _rlPL  = 0;
+        _rlDir = 0;
+    }
+
+    if (Buy[i] AND BuyPrice[i] > 0)
+    {
+        _rlEntry = BuyPrice[i];
+        _rlQty   = floor(PositionSize[i] / BuyPrice[i]);
+        _rlDir   = 1;
+    }
+    if (Short[i] AND ShortPrice[i] > 0)
+    {
+        _rlEntry = ShortPrice[i];
+        _rlQty   = floor(PositionSize[i] / ShortPrice[i]);
+        _rlDir   = -1;
+    }
+
+    if (Sell[i] AND _rlDir == 1)
+    {
+        _svKey = _svPfx + DateTimeToStr(dt[i]);
+        _frozen = StaticVarGet(_svKey);
+        if (IsNull(_frozen))
+        {
+            _tradePL = (SellPrice[i] - _rlEntry) * _rlQty;
+            StaticVarSet(_svKey, _tradePL);
+            if (DebugTrace)
+                _TRACE("$$$ LONG CLOSED (NEW) bar=" + NumToStr(i, 1.0) +
+                       " entry=" + NumToStr(_rlEntry, 1.4) +
+                       " exit=" + NumToStr(SellPrice[i], 1.4) +
+                       " qty=" + NumToStr(_rlQty, 1.0) +
+                       " tradePL=" + NumToStr(_tradePL, 1.2));
+        }
+        else
+        {
+            _tradePL = _frozen;
+        }
+        _rlPL = _rlPL + _tradePL;
+        _rlDir = 0;
+    }
+    if (Cover[i] AND _rlDir == -1)
+    {
+        _svKey = _svPfx + DateTimeToStr(dt[i]);
+        _frozen = StaticVarGet(_svKey);
+        if (IsNull(_frozen))
+        {
+            _tradePL = (_rlEntry - CoverPrice[i]) * _rlQty;
+            StaticVarSet(_svKey, _tradePL);
+            if (DebugTrace)
+                _TRACE("$$$ SHORT CLOSED (NEW) bar=" + NumToStr(i, 1.0) +
+                       " entry=" + NumToStr(_rlEntry, 1.4) +
+                       " exit=" + NumToStr(CoverPrice[i], 1.4) +
+                       " qty=" + NumToStr(_rlQty, 1.0) +
+                       " tradePL=" + NumToStr(_tradePL, 1.2));
+        }
+        else
+        {
+            _tradePL = _frozen;
+        }
+        _rlPL = _rlPL + _tradePL;
+        _rlDir = 0;
+    }
+
+    RealPL[i] = _rlPL;
+}
+
+// Store day's realized P/L in a StaticVar so GFX works regardless of zoom level
+_svDayPL = _svPfx + "DayPL_" + NumToStr(dn[BarCount - 1], 1.0);
+if (_rlPL != 0)
+    StaticVarSet(_svDayPL, _rlPL);

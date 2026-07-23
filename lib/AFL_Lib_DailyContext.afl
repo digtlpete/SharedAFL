@@ -1,0 +1,95 @@
+// ============================================================================
+// LIB: DAILY CONTEXT METRICS — daily EMAs + Average Daily RTH Volume
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
+//
+// REQUIRES:
+//   NewDay, IsRTH, LastRthBar        (from AFL_Lib_SessionTime.afl)
+//   AdvLookback                      (param, days)
+//
+// PROVIDES (globals):
+//   Ema10Daily, Ema21Daily, PctVs10DayEMA, PctVs21DayEMA
+//   AvgDailyRthVol, AdvFullLookbackReady
+// ============================================================================
+
+// ============================================================================
+// Close vs *daily* 10- and 21-period EMAs: signed % (chart Close vs expanded
+// daily EMA). Positive = above EMA, negative = below. inDaily EMAs, expanded.
+// ============================================================================
+TimeFrameSet(inDaily);
+_dEma10 = EMA(C, 10);
+_dEma21 = EMA(C, 21);
+TimeFrameRestore();
+Ema10Daily = TimeFrameExpand(_dEma10, inDaily);
+Ema21Daily = TimeFrameExpand(_dEma21, inDaily);
+PctVs10DayEMA = IIf(Ema10Daily > 0, 100 * (C - Ema10Daily) / Ema10Daily, 0);
+PctVs21DayEMA = IIf(Ema21Daily > 0, 100 * (C - Ema21Daily) / Ema21Daily, 0);
+
+// ============================================================================
+// AVERAGE DAILY RTH VOLUME (completed sessions only)  ORB_ADV_v11
+// Prefer AmiBroker daily-compressed session volume (DB RTH sum — correct when
+// 1-min bar V is sparse). Fall back to a running sum of IsRTH bar V on the
+// same calendar day when daily TF is unavailable.
+// ADV = mean of up to AdvLookback prior completed sessions (excludes today).
+// Single O(BarCount) pass: running day volume + ring buffer (same pattern as
+// Rel OR Vol). v10 used nested backward scans and was O(BarCount^2).
+// ============================================================================
+TimeFrameSet(inDaily);
+_sessVolDaily = V;
+TimeFrameRestore();
+SessVolDailyExp = TimeFrameExpand(_sessVolDaily, inDaily, expandLast);
+
+_advPfx = "ORBADV_" + Name() + "_";
+_advN = Max(Min(AdvLookback, 252), 1);
+dayRthVolAccum = 0;
+advHead = -1;
+advFilled = 0;
+advSum = 0;
+dayAdvMean = 0;
+dayAdvFullOK = False;
+
+_avgDailyMA = 0;
+_advFullOK  = 0;
+
+for (i = 0; i < BarCount; i++)
+{
+    if (NewDay[i])
+    {
+        dayAdvMean = IIf(advFilled > 0, advSum / advFilled, 0);
+        dayAdvFullOK = (advFilled >= AdvLookback);
+        dayRthVolAccum = 0;
+    }
+
+    if (IsRTH[i])
+        dayRthVolAccum = dayRthVolAccum + V[i];
+
+    if (LastRthBar[i])
+    {
+        tfVol = SessVolDailyExp[i];
+        sessVol = IIf(tfVol > 0, tfVol, dayRthVolAccum);
+        if (sessVol > 0)
+        {
+            advHead = advHead + 1;
+            if (advHead >= _advN) advHead = 0;
+            _advKey = _advPfx + advHead;
+            if (advFilled < _advN)
+            {
+                VarSet(_advKey, sessVol);
+                advSum = advSum + sessVol;
+                advFilled = advFilled + 1;
+            }
+            else
+            {
+                oldV = Nz(VarGet(_advKey));
+                VarSet(_advKey, sessVol);
+                advSum = advSum - oldV + sessVol;
+            }
+        }
+    }
+
+    _avgDailyMA[i] = dayAdvMean;
+    _advFullOK[i]  = dayAdvFullOK;
+}
+
+AvgDailyRthVol       = _avgDailyMA;
+AdvFullLookbackReady = _advFullOK;

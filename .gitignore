@@ -1,0 +1,3 @@
+# SharedAFL
+*.bak
+__pycache__/

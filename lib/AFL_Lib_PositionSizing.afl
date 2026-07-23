@@ -1,0 +1,36 @@
+// ============================================================================
+// LIB: POSITION SIZING - percent-risk / fixed-share with equity caps
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl entry blocks (Phase 2 extraction).
+// Pure functions; call them from the strategy's entry logic.
+//
+// REQUIRES (params defined BEFORE #include):
+//   UsePercentRisk, RiskPercent, MaxShares, FixedShares,
+//   OverrideBalance, MaxPctOfEquity
+//
+// PROVIDES:
+//   SizingRiskQty(stopDist)         shares allowed by % risk of balance
+//   SizingFinalQty(riskQty, entryP) final qty after MaxShares + equity caps
+//                                   (riskQty ignored when UsePercentRisk off)
+// ============================================================================
+
+function SizingRiskQty(stopDist)
+{
+    global OverrideBalance, RiskPercent;
+    acctBal = IIf(OverrideBalance > 0, OverrideBalance, 100000);
+    maxRisk = acctBal * (RiskPercent / 100);
+    riskPerShare = stopDist;
+    return floor(maxRisk / riskPerShare);
+}
+
+function SizingFinalQty(riskQty, entryP)
+{
+    // Array-safe: entryP/riskQty are often arrays (e.g. Close / stopDist).
+    // AFL if/while cannot take array conditions - use IIf throughout.
+    global UsePercentRisk, MaxShares, MaxPctOfEquity, OverrideBalance, FixedShares;
+    acctBal = IIf(OverrideBalance > 0, OverrideBalance, 100000);
+    maxQtyByEquity = floor((acctBal * MaxPctOfEquity / 100) / entryP);
+    qRisk  = Min(Max(1, Min(riskQty, MaxShares)), Max(1, maxQtyByEquity));
+    qFixed = IIf(maxQtyByEquity >= 1, Min(FixedShares, maxQtyByEquity), FixedShares);
+    return IIf(UsePercentRisk, qRisk, qFixed);
+}

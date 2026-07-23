@@ -1,0 +1,57 @@
+// ============================================================================
+// LIB: SESSION TIME HELPERS (signal-agnostic plumbing)
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
+//
+// REQUIRES (defined by the including strategy BEFORE #include):
+//   RthStartHour, RthStartMin, RthEndHour, RthEndMin      (session params)
+//   UseTimeFilter, TimeFilterStartHour/Min, TimeFilterEndHour/Min
+//   UseBlackout, BlackoutStartHour/Min, BlackoutEndHour/Min
+//   ExitAtRthEnd, ExitHour, ExitMinute
+//
+// PROVIDES (globals):
+//   dt, hr, mn, dn, bi
+//   RthStartTotalMin, RthEndTotalMin, BarTotalMin, MinutesSinceOpen, IsRTH
+//   NewDay, RthOpen, LastRthBar
+//   TFStartTotalMin, TFEndTotalMin, BOStartTotalMin, BOEndTotalMin,
+//   ExitTimeTotalMin, WithinTimeFilter, InBlackout, PastExitTime
+// ============================================================================
+
+dt  = DateTime();
+hr  = Hour();
+mn  = Minute();
+dn  = DateNum();
+bi  = BarIndex();
+
+RthStartTotalMin = RthStartHour * 60 + RthStartMin;
+RthEndTotalMin   = RthEndHour * 60 + RthEndMin;
+
+BarTotalMin      = hr * 60 + mn;
+MinutesSinceOpen = BarTotalMin - RthStartTotalMin;
+IsRTH            = BarTotalMin >= RthStartTotalMin AND BarTotalMin < RthEndTotalMin;
+
+// Day boundaries
+NewDay    = dn != Ref(dn, -1);
+// First RTH bar of session: also true when calendar day changes even if prior
+// bar was IsRTH (no overnight bar in RTH-only DB — old Ref-only test missed this).
+RthOpen   = IsRTH AND (NOT Ref(IsRTH, -1) OR dn != Ref(dn, -1));
+// Last RTH bar (loop avoids Ref(x,1) forward-ref Info 1001)
+LastRthBar = False;
+for (i = 0; i < BarCount - 1; i++)
+{
+    if (IsRTH[i] AND (NOT IsRTH[i + 1] OR dn[i + 1] != dn[i]))
+        LastRthBar[i] = True;
+}
+
+// ============================================================================
+// TIME FILTERS
+// ============================================================================
+TFStartTotalMin = TimeFilterStartHour * 60 + TimeFilterStartMin;
+TFEndTotalMin   = TimeFilterEndHour * 60 + TimeFilterEndMin;
+BOStartTotalMin = BlackoutStartHour * 60 + BlackoutStartMin;
+BOEndTotalMin   = BlackoutEndHour * 60 + BlackoutEndMin;
+ExitTimeTotalMin = ExitHour * 60 + ExitMinute;
+
+WithinTimeFilter = NOT UseTimeFilter OR (BarTotalMin >= TFStartTotalMin AND BarTotalMin <= TFEndTotalMin);
+InBlackout       = UseBlackout AND (BarTotalMin >= BOStartTotalMin AND BarTotalMin < BOEndTotalMin);
+PastExitTime     = ExitAtRthEnd AND (BarTotalMin >= ExitTimeTotalMin);

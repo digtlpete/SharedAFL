@@ -1,0 +1,223 @@
+// ============================================================================
+// LIB: CHART OVERLAYS — VWAP band plots, stop line, position info, alerts
+// ----------------------------------------------------------------------------
+// Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
+// Rendering only — nothing here can change backtest signals.
+//
+// REQUIRES:
+//   Display params: ShowRthVwapBands, ShowRthVwap2SD, VwapColor/Style/Width,
+//     SD1Color/Style/Width, SD2Color/Style/Width, ShowStopLine,
+//     StopLineColor, StopLineWidth, ShowEntryLine, EntryLineColor,
+//     EntryLineWidth
+//   Data: RthVwap, RthVwapU1SD, RthVwapL1SD, RthVwapU2SD, RthVwapL2SD
+//   Signals: Buy, Sell, Short, Cover
+//   Position arrays: PosDir, PosEntry, PosStop, PosTarget, PosQty
+//   Misc: EnableAutoTrade (param), StrategyCode (string), _svPfx, dn
+//
+// PROVIDES:
+//   IbLogEvt() helper (used by the IB engine), lb (= BarCount - 1)
+// ============================================================================
+
+// ============================================================================
+// DISPLAY — RTH VWAP + standard deviation bands (intraday cumulative)
+// ============================================================================
+rthVwapShow = ShowRthVwapBands;
+rth2sdShow  = ShowRthVwapBands AND ShowRthVwap2SD;
+
+Plot(IIf(rth2sdShow,  RthVwapL2SD, Null), "RTH -2 SD", SD2Color,  SD2Style, Null, Null, 0, 0, SD2Width);
+Plot(IIf(rth2sdShow,  RthVwapU2SD, Null), "RTH +2 SD", SD2Color,  SD2Style, Null, Null, 0, 0, SD2Width);
+Plot(IIf(rthVwapShow, RthVwapL1SD, Null), "RTH -1 SD", SD1Color,  SD1Style, Null, Null, 0, 0, SD1Width);
+Plot(IIf(rthVwapShow, RthVwapU1SD, Null), "RTH +1 SD", SD1Color,  SD1Style, Null, Null, 0, 0, SD1Width);
+Plot(IIf(rthVwapShow, RthVwap,     Null), "RTH VWAP",  VwapColor, VwapStyle, Null, Null, 0, 0, VwapWidth);
+
+// ============================================================================
+// DISPLAY — Break Markers
+// ============================================================================
+PlotShapes(IIf(Buy, shapeUpArrow, shapeNone), colorGreen, 0, L, -15);
+PlotShapes(IIf(Short, shapeDownArrow, shapeNone), colorRed, 0, H, -15);
+PlotShapes(IIf(Sell, shapeCircle, shapeNone), colorOrange, 0, H, 15);
+PlotShapes(IIf(Cover, shapeCircle, shapeNone), colorOrange, 0, L, -15);
+
+// ============================================================================
+// DISPLAY — Active Entry + Stop / Trailing Stop lines (GFX horizontal)
+// ============================================================================
+// Shared axis metrics for any level lines drawn this refresh.
+_axMin   = Status("axisminy");
+_axMax   = Status("axismaxy");
+_pxTop   = Status("pxcharttop");
+_pxBot   = Status("pxchartbottom");
+_pxLeft  = Status("pxchartleft");
+_pxRight = Status("pxchartright");
+_axOk    = (_axMax > _axMin);
+
+// Prefer IB live levels when auto-trading; fall back to backtest Pos* arrays.
+_curEntry = 0;
+_curStop  = 0;
+if (EnableAutoTrade)
+{
+    _ibSvP = "IB_" + Name() + "_";
+    _ibDir = Nz(StaticVarGet(_ibSvP + "Dir"));
+    if (_ibDir != 0)
+    {
+        _curEntry = Nz(StaticVarGet(_ibSvP + "FillPx"));
+        _curStop  = Nz(StaticVarGet(_ibSvP + "CurStop"));
+    }
+}
+if (_curEntry == 0)
+    _curEntry = Nz(PosEntry[BarCount - 1]);
+if (_curStop == 0)
+    _curStop = Nz(PosStop[BarCount - 1]);
+
+if (ShowEntryLine AND _curEntry > 0 AND _axOk)
+{
+    _entryY = _pxBot - (_curEntry - _axMin) / (_axMax - _axMin) * (_pxBot - _pxTop);
+
+    GfxSetOverlayMode(1);
+    // Pen style 2 = dashed (same as stop line).
+    GfxSelectPen(EntryLineColor, EntryLineWidth, 2);
+    GfxMoveTo(_pxLeft, _entryY);
+    GfxLineTo(_pxRight, _entryY);
+
+    GfxSelectFont("Tahoma", 8, 700);
+    GfxSetBkMode(1);
+    GfxSetTextColor(EntryLineColor);
+    GfxTextOut(NumToStr(_curEntry, 1.2), _pxRight + 4, _entryY - 8);
+}
+
+if (ShowStopLine AND _curStop > 0 AND _axOk)
+{
+    _stopY = _pxBot - (_curStop - _axMin) / (_axMax - _axMin) * (_pxBot - _pxTop);
+
+    GfxSetOverlayMode(1);
+    GfxSelectPen(StopLineColor, StopLineWidth, 2);
+    GfxMoveTo(_pxLeft, _stopY);
+    GfxLineTo(_pxRight, _stopY);
+
+    GfxSelectFont("Tahoma", 8, 700);
+    GfxSetBkMode(1);
+    GfxSetTextColor(StopLineColor);
+    GfxTextOut(NumToStr(_curStop, 1.2), _pxRight + 4, _stopY - 8);
+}
+
+// ============================================================================
+// DISPLAY — Position Info Overlay (GFX)
+// ----------------------------------------------------------------------------
+// When EnableAutoTrade is on we MUST reflect the live IB account state, not
+// the backtest's Pos* arrays.  Those arrays describe a simulated run; in
+// auto-trading they routinely diverge from reality (stale in_trade flags
+// from prior history, exits via VWAP rules while IB still holds, scale-ins,
+// manual adjustments, etc.).  Reading IB StaticVars guarantees the overlay
+// shows what the trader actually has at the broker.  When auto-trade is
+// off, fall back to the backtest Pos* arrays so historical chart inspection
+// still works.
+// ============================================================================
+lb = BarCount - 1;
+
+// ---------------------------------------------------------------------------
+// On-chart event log helper.
+// The AmiBroker trace window scrolls far too fast to follow live, so the key
+// auto-trade events (orders placed / cancelled / filled / errors) are mirrored
+// into a small per-symbol rolling buffer that is rendered on the chart Title.
+// Newest entry first; the buffer is length-capped so old lines fall off.
+// ---------------------------------------------------------------------------
+function IbLogEvt(evtPfx, evtMsg)
+{
+    evtKey  = evtPfx + "EvtLog";
+    evtPrev = StaticVarGetText(evtKey);
+    StaticVarSetText(evtKey, StrLeft(evtMsg + "\n" + evtPrev, 500));
+}
+
+_useIB = False;
+if (EnableAutoTrade)
+{
+    _ibSvP = "IB_" + Name() + "_";
+    _pDir  = Nz(StaticVarGet(_ibSvP + "Dir"));
+    _useIB = True;
+    if (_pDir != 0)
+    {
+        _pEntry = Nz(StaticVarGet(_ibSvP + "FillPx"));
+        _pStop  = Nz(StaticVarGet(_ibSvP + "CurStop"));
+        _pTgt   = Nz(StaticVarGet(_ibSvP + "TargetPx"));
+        _pQty   = Nz(StaticVarGet(_ibSvP + "Qty"));
+    }
+    else
+    {
+        _pEntry = 0; _pStop = 0; _pTgt = 0; _pQty = 0;
+    }
+}
+if (NOT _useIB)
+{
+    _pDir   = PosDir[lb];
+    _pEntry = PosEntry[lb];
+    _pStop  = PosStop[lb];
+    _pTgt   = PosTarget[lb];
+    _pQty   = PosQty[lb];
+}
+_pClose = C[lb];
+_pReal  = Nz(StaticVarGet(_svPfx + "DayPL_" + NumToStr(dn[lb], 1.0)));
+_pUnreal = 0;
+
+GfxSetOverlayMode(1);
+GfxSetBkMode(1);
+
+_boxX  = 10;
+_boxY  = 145;
+_lineH = 18;
+_row   = 0;
+
+if (_pDir != 0)
+{
+    if (_pDir == 1)
+    {
+        _pUnreal = (_pClose - _pEntry) * _pQty;
+        _pSide   = "LONG";
+        _sideClr = colorGreen;
+    }
+    else
+    {
+        _pUnreal = (_pEntry - _pClose) * _pQty;
+        _pSide   = "SHORT";
+        _sideClr = colorRed;
+    }
+
+    GfxSelectFont("Tahoma", 9, 700);
+    GfxSetTextColor(_sideClr);
+    GfxTextOut(_pSide + "  " + NumToStr(_pQty, 1.0) + " shares", _boxX, _boxY + _lineH * _row);
+    _row++;
+
+    GfxSelectFont("Tahoma", 9, 400);
+    GfxSetTextColor(colorWhite);
+    if (_pEntry > 0) _entryStr = NumToStr(_pEntry, 1.2); else _entryStr = "--";
+    if (_pStop  > 0) _stopStr  = NumToStr(_pStop,  1.2); else _stopStr  = "--";
+    if (_pTgt   > 0) _tgtStr   = NumToStr(_pTgt,   1.2); else _tgtStr   = "--";
+    GfxTextOut("Entry:        " + _entryStr, _boxX, _boxY + _lineH * _row); _row++;
+    GfxTextOut("Stop:         " + _stopStr,  _boxX, _boxY + _lineH * _row); _row++;
+    GfxTextOut("Target:       " + _tgtStr,   _boxX, _boxY + _lineH * _row); _row++;
+
+    GfxSetTextColor(IIf(_pUnreal >= 0, colorGreen, colorRed));
+    GfxTextOut("Unrealized:   " + NumToStr(_pUnreal, 1.2), _boxX, _boxY + _lineH * _row); _row++;
+}
+else
+{
+    GfxSelectFont("Tahoma", 9, 700);
+    GfxSetTextColor(colorGrey40);
+    GfxTextOut("FLAT", _boxX, _boxY + _lineH * _row);
+    _row++;
+}
+
+_row++;
+_pTotal = _pReal + _pUnreal;
+
+GfxSelectFont("Tahoma", 9, 400);
+GfxSetTextColor(IIf(_pReal >= 0, colorGreen, colorRed));
+GfxTextOut("Realized:     " + NumToStr(_pReal, 1.2), _boxX, _boxY + _lineH * _row); _row++;
+
+GfxSelectFont("Tahoma", 9, 700);
+GfxSetTextColor(IIf(_pTotal >= 0, colorGreen, colorRed));
+GfxTextOut("Total P/L:    " + NumToStr(_pTotal, 1.2), _boxX, _boxY + _lineH * _row);
+
+// ============================================================================
+// ALERTS — Trade Entry Only
+// ============================================================================
+AlertIf(Buy, "SOUND C:\\Windows\\Media\\notify.wav", StrategyCode + " LONG Entry: " + Name(), 1);
+AlertIf(Short, "SOUND C:\\Windows\\Media\\notify.wav", StrategyCode + " SHORT Entry: " + Name(), 2);
