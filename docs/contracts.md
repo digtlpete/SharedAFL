@@ -25,3 +25,18 @@ strategies can run in one AmiBroker session without colliding.
 
 AmiBroker resolves relative `#include` paths against its Formulas directory,
 not the including file. Always use absolute paths into SharedAFL.
+
+## IBEngine method 3 (pullback LMT) brackets
+
+When `EntryMethodParam == 3` and stop distance is available
+(`StopDistOverride` or ATR×`AtrStopMult`), `AFL_Lib_IBEngine.afl` places a
+native IB bracket:
+
+- parent LMT at `LmtPxLong` / `LmtPxShort` (`Transmit=False` while children attach)
+- child STP at entry ± stop dist (`ParentID` + OCA)
+- optional child LMT TP when `TargetDistOverride` > 0 and not VWAP-LMT exit mode
+- last child uses `AutoTradeTransmit` so the whole bracket transmits together
+
+Pending child OIDs are stored in `BrkStopOID{Long,Short}` /
+`BrkTgtOID{Long,Short}` until fill promotes them to `StopOID` / `TargetOID`.
+Fill protection therefore lives at the broker even if the chart is closed.

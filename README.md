@@ -26,7 +26,7 @@ SharedAFL/
 | `AFL_Lib_RealizedPL.afl` | static-var realized P/L tracking |
 | `AFL_Lib_IbLogEvt.afl` | `IbLogEvt()` helper (include at formula top level) |
 | `AFL_Lib_ChartOverlays.afl` | band plots, markers, GFX info box (needs IbLogEvt) |
-| `AFL_Lib_IBEngine.afl` | live IB execution behind a documented signal contract |
+| `AFL_Lib_IBEngine.afl` | live IB execution behind a documented signal contract (method 3 = native IB brackets: parent LMT + child STP/TP) |
 
 ## Include path
 
