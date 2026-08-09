@@ -24,7 +24,8 @@ SharedAFL/
 | `AFL_Lib_UniverseRank.afl` | daily Top-N cross-sectional gate (adapter inputs) |
 | `AFL_Lib_PositionSizing.afl` | `SizingRiskQty()` / `SizingFinalQty()` (scalar) |
 | `AFL_Lib_RealizedPL.afl` | static-var realized P/L tracking |
-| `AFL_Lib_ChartOverlays.afl` | band plots, markers, GFX info box, `IbLogEvt()` |
+| `AFL_Lib_IbLogEvt.afl` | `IbLogEvt()` helper (include at formula top level) |
+| `AFL_Lib_ChartOverlays.afl` | band plots, markers, GFX info box (needs IbLogEvt) |
 | `AFL_Lib_IBEngine.afl` | live IB execution behind a documented signal contract |
 
 ## Include path

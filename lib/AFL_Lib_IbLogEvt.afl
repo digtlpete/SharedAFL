@@ -1,0 +1,16 @@
+// ============================================================================
+// LIB: IB EVENT LOG HELPER
+// ----------------------------------------------------------------------------
+// Must be #include'd at FORMULA TOP LEVEL (never inside if/else/for).
+// AmiBroker rejects `function` definitions inside compound statements.
+//
+// PROVIDES:
+//   IbLogEvt(evtPfx, evtMsg) — append a line to the per-symbol IB event log
+// ============================================================================
+
+function IbLogEvt(evtPfx, evtMsg)
+{
+    evtKey  = evtPfx + "EvtLog";
+    evtPrev = StaticVarGetText(evtKey);
+    StaticVarSetText(evtKey, StrLeft(evtMsg + "\n" + evtPrev, 500));
+}

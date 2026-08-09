@@ -15,6 +15,14 @@
 //   NewDay, RthOpen, LastRthBar
 //   TFStartTotalMin, TFEndTotalMin, BOStartTotalMin, BOEndTotalMin,
 //   ExitTimeTotalMin, WithinTimeFilter, InBlackout, PastExitTime
+//   PcToEasternHours, NowEasternTotalMin
+//
+// TIMEZONE:
+//   Session params (RTH / blackout / exit / time filter) and bar Hour()/Minute()
+//   are Eastern (EST/EDT) as stamped in the AmiBroker database.
+//   AmiBroker Now() is the PC's local clock — on a Mountain PC that is MST/MDT.
+//   NowEasternTotalMin converts PC Now() → Eastern via PcToEasternHours so live
+//   wall-clock gates match the Eastern session params (Mountain→Eastern = 2).
 // ============================================================================
 
 dt  = DateTime();
@@ -23,12 +31,25 @@ mn  = Minute();
 dn  = DateNum();
 bi  = BarIndex();
 
+// Hours to ADD to PC-local Now() to get Eastern. US zones that share DST keep
+// a constant offset year-round (MT→ET = 2, CT→ET = 1, ET→ET = 0).
+PcToEasternHours = Param("PC Local to Eastern (hrs)", 2, -12, 12, 1);
+
 RthStartTotalMin = RthStartHour * 60 + RthStartMin;
 RthEndTotalMin   = RthEndHour * 60 + RthEndMin;
 
 BarTotalMin      = hr * 60 + mn;
 MinutesSinceOpen = BarTotalMin - RthStartTotalMin;
 IsRTH            = BarTotalMin >= RthStartTotalMin AND BarTotalMin < RthEndTotalMin;
+
+// Wall-clock Eastern minutes-since-midnight (for live IB gates).
+_nowTN = Now(4);
+_nowLocalMin = floor(_nowTN / 10000) * 60 + floor((_nowTN % 10000) / 100);
+NowEasternTotalMin = _nowLocalMin + round(PcToEasternHours) * 60;
+if (NowEasternTotalMin >= 1440)
+    NowEasternTotalMin = NowEasternTotalMin - 1440;
+if (NowEasternTotalMin < 0)
+    NowEasternTotalMin = NowEasternTotalMin + 1440;
 
 // Day boundaries
 NewDay    = dn != Ref(dn, -1);

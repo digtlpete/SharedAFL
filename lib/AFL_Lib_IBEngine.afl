@@ -10,11 +10,28 @@
 //                       pre-places STP/STPLMT at these boundaries)
 //   Signal arrays     : Buy, Sell, Short, Cover (for MKT-mode confirmations)
 //   Loop state        : in_trade, ibBktLongBreaks, ibBktShortBreaks
+//   Position arrays   : PosDir (last-bar direction when in_trade; used by
+//                       optional EnableAflPositionAdopt MKT sync)
+//   Optional          : EnableAflPositionAdopt (1 = when IB flat but AFL
+//                       still in_trade, fire MKT to adopt that position)
+//                     : UseVwapLimitExit (1 = bracket TP: resting LMT at
+//                       RTH VWAP alongside protective STP; first fill
+//                       cancels the sibling. Suppresses Sell/Cover→MKT.
+//                       Default 0 when unset via Nz().)
+//                     : StaticVar IB_<sym>_StopDistOverride (points) —
+//                       when > 0, replaces ATR*AtrStopMult for sizing +
+//                       protective STP (zone / structure stops).
+//                     : StaticVar IB_<sym>_TargetDistOverride (points) —
+//                       when > 0, places a resting LMT TP at fill±dist on
+//                       fill (fixed R-multiple). First fill cancels STP.
 //   Sizing params     : UsePercentRisk, RiskPercent, MaxShares, FixedShares,
 //                       OverrideBalance, MaxPctOfEquity, MaxStopLossPts
 //   Entry params      : EntryMethodParam, MktConfirmClose, StpLmtAtrFactor,
 //                       EnableLong, EnableShort, MaxBreakNumber, IBTickSize,
 //                       AutoTradeTransmit, EnableAutoTrade
+//                       EntryMethodParam: 0=MKT, 1=STP, 2=STPLMT, 3=LMT
+//                       (method 3 reads StaticVars LmtArmedLong/Short +
+//                       LmtPxLong/Short; cancel when armed flag clears)
 //   Stops/trail params: AtrStopMult, AtrTargetMult, UseAtrTrailing,
 //                       AtrTrailP1Factor, AtrTrailP2Factor, AtrTrailP2TFactor,
 //                       Phase2ActBars, Phase2TightBars, EnablePhaseReversal,
@@ -26,7 +43,8 @@
 //                       EnableMaxPortfolioPositions, MaxPortfolioPositions
 //   Context (libs)    : DailyATR, IsRTH, BarTotalMin, ExitTimeTotalMin,
 //                       WithinTimeFilter, InBlackout, dn, RthVwap + SD bands,
-//                       VwapPhase, IbLogEvt() (ChartOverlays lib), StrategyCode
+//                       VwapPhase, IbLogEvt() (AFL_Lib_IbLogEvt.afl, top-level),
+//                       StrategyCode
 //   Misc              : DebugTrace, DebugVerbose, RecoveryFlagFile,
 //                       TriggerCancelEntry, TriggerPanic, TriggerResetTrack
 //
@@ -70,7 +88,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
     // in DebugView for a given symbol, that chart is running a STALE cached
     // copy (e.g. one that still has the old CancelAllPendingOrders sweep) and
     // must be reloaded. Bump the date suffix whenever you change this file.
-    ORB_BUILD = "ORB build 2026-06-12a (no-sweep + entry-OID self-heal)";
+    ORB_BUILD = "ORB build 2026-08-04b (Eastern wall-clock gates)";
     _ibBuildKey = "IB_" + Name() + "_BuildStampDN";
     if (DebugTrace AND Nz(StaticVarGet(_ibBuildKey)) != dn[BarCount - 1])
     {
@@ -95,16 +113,12 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         lb       = BarCount - 1;
         ibPos    = ibc.GetPositionSize(ibTicker);
 
-        // Wall-clock minutes-since-midnight from the PC system clock
-        // (Now(4) -> TIMENUM HHMMSS). The EOD flatten/timed-exit gates
-        // below OR this against the last bar's timestamp so the close
-        // still fires when no fresh bar has printed after the exit time
-        // (low-liquidity name, feed hiccup, or a forming bar that hasn't
-        // crossed the exit minute yet). Bar timestamps and Now() are both
-        // local PC time here, so they share the same ExitTimeTotalMin scale.
-        _ibNowTN       = Now(4);
-        ibNowTotalMin  = floor(_ibNowTN / 10000) * 60
-                       + floor((_ibNowTN % 10000) / 100);
+        // Wall-clock Eastern minutes-since-midnight (from SessionTime:
+        // PC Now() + PcToEasternHours). Session params and bar timestamps
+        // are Eastern; raw Now() on a Mountain PC is MST/MDT and must not
+        // be compared to Exit/Blackout hours directly. OR against the last
+        // bar so EOD/blackout still fire when no fresh bar has printed.
+        ibNowTotalMin = NowEasternTotalMin;
 
         // Pre-initialise variables that are written only inside the
         // ibSessionOK / ibLiveBar branches but read later in the status
@@ -124,12 +138,19 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // the next pass (1s later) will trail normally with a properly
         // registered OID.
         ibJustFilled = False;
+        // Same settle rule for a freshly placed VWAP take-profit LMT.
+        ibJustArmedTarget = False;
+
+        // Bracket VWAP LMT take-profit (MR). Optional — strategies that
+        // omit it stay on the legacy Sell/Cover → MKT path.
+        ibUseVwapLmt = Nz(UseVwapLimitExit);
 
         svP = "IB_" + ibTicker + "_";
 
         ibLongOID   = StaticVarGetText(svP + "LongOID");
         ibShortOID  = StaticVarGetText(svP + "ShortOID");
         ibStopOID   = StaticVarGetText(svP + "StopOID");
+        ibTargetOID = StaticVarGetText(svP + "TargetOID");
         ibDir       = Nz(StaticVarGet(svP + "Dir"));
         ibSvDN      = Nz(StaticVarGet(svP + "DN"));
         ibQtyStored = Nz(StaticVarGet(svP + "Qty"));
@@ -230,8 +251,13 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         if (ibSessionOK)
         {
 
-        // Position sizing
+        // Position sizing / protective stop distance.
+        // Strategies may publish a per-symbol point override (e.g. SZDZ zone
+        // far-edge + ATR pad) via StaticVar before this include.
         ibStopDist = ibATR * AtrStopMult;
+        _ibStopOv = Nz(StaticVarGet(svP + "StopDistOverride"));
+        if (_ibStopOv > 0)
+            ibStopDist = _ibStopOv;
         if (MaxStopLossPts > 0 AND ibStopDist > MaxStopLossPts)
             ibStopDist = MaxStopLossPts;
 
@@ -302,11 +328,15 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         if (TriggerPanic)
         {
             ibLastStopOIDPanic = StaticVarGetText(svP + "LastStopOID");
+            ibLastTgtOIDPanic  = StaticVarGetText(svP + "LastTargetOID");
             if (ibLongOID != "")        ibc.CancelOrder(ibLongOID);
             if (ibShortOID != "")       ibc.CancelOrder(ibShortOID);
             if (ibStopOID != "")        ibc.CancelOrder(ibStopOID);
             if (ibLastStopOIDPanic != "" AND ibLastStopOIDPanic != ibStopOID)
                 ibc.CancelOrder(ibLastStopOIDPanic);
+            if (ibTargetOID != "")      ibc.CancelOrder(ibTargetOID);
+            if (ibLastTgtOIDPanic != "" AND ibLastTgtOIDPanic != ibTargetOID)
+                ibc.CancelOrder(ibLastTgtOIDPanic);
 
             // Flatten the live position for THIS symbol only.  Save the
             // returned OID into the same EodCloseOID slot used by the EOD
@@ -321,12 +351,16 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 ibPanicCloseOID = ibc.PlaceOrder(ibTicker, "BUY", -ibPos, "MKT",
                     0, 0, "DAY", AutoTradeTransmit, IBTickSize);
 
-            ibLongOID = ""; ibShortOID = ""; ibStopOID = "";
+            ibLongOID = ""; ibShortOID = ""; ibStopOID = ""; ibTargetOID = "";
             ibDir = 0;
             StaticVarSetText(svP + "LongOID", "");
             StaticVarSetText(svP + "ShortOID", "");
             StaticVarSetText(svP + "StopOID", "");
             StaticVarSetText(svP + "LastStopOID", "");
+            StaticVarSetText(svP + "TargetOID", "");
+            StaticVarSetText(svP + "LastTargetOID", "");
+            StaticVarSet(svP + "CurTarget", 0);
+            StaticVarSet(svP + "FixedLmt", 0);
             StaticVarSetText(svP + "EodCloseOID", ibPanicCloseOID);
             StaticVarSet(svP + "Dir", 0);
             StaticVarSet(svP + "CloseSent", 1);
@@ -364,6 +398,14 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // changes, or after Issue-1 style "no stop on an open position"
         // anomalies).
         //
+        // Open-position rebuild:
+        //   - If the take-profit LMT already filled: cancel any leftover
+        //     protective STP and clear state (do NOT re-place the bracket).
+        //   - Else: leave StopOID empty so the IN-POSITION heartbeat
+        //     re-places the STP, and immediately re-place a fixed R-multiple
+        //     LMT TP when TargetDistOverride / FixedLmt applies. VWAP LMT
+        //     mode still re-arms on next VWAP touch.
+        //
         // CRITICAL: cancel only the order IDs we placed for ibTicker. We
         // deliberately do NOT call ibc.CancelAllPendingOrders(ibTicker)
         // here -- IBController's ticker filter is unreliable when the
@@ -373,38 +415,215 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // cancellation is mathematically isolated to this chart.
         if (TriggerResetTrack)
         {
-            ibLastStopOIDReset = StaticVarGetText(svP + "LastStopOID");
-            if (ibLongOID != "")        ibc.CancelOrder(ibLongOID);
-            if (ibShortOID != "")       ibc.CancelOrder(ibShortOID);
-            if (ibStopOID != "")        ibc.CancelOrder(ibStopOID);
-            if (ibLastStopOIDReset != "" AND ibLastStopOIDReset != ibStopOID)
-                ibc.CancelOrder(ibLastStopOIDReset);
+            // Preserve economic levels before wipe when a broker position is
+            // still open — used as fallback if IB Avg. cost is unavailable.
+            _rstPreFill   = Nz(StaticVarGet(svP + "FillPx"));
+            _rstPreStop   = Nz(StaticVarGet(svP + "CurStop"));
+            _rstPreTgt    = Nz(StaticVarGet(svP + "TargetPx"));
+            _rstPreCurTgt = Nz(StaticVarGet(svP + "CurTarget"));
+            _rstPreFixed  = Nz(StaticVarGet(svP + "FixedLmt"));
+            _rstTgtDist   = Nz(StaticVarGet(svP + "TargetDistOverride"));
 
-            ibLongOID = ""; ibShortOID = ""; ibStopOID = "";
-            ibDir = 0;
-            StaticVarSetText(svP + "LongOID", "");
-            StaticVarSetText(svP + "ShortOID", "");
-            StaticVarSetText(svP + "StopOID", "");
-            StaticVarSetText(svP + "LastStopOID", "");
-            StaticVarSetText(svP + "EodCloseOID", "");
-            StaticVarSet(svP + "Dir", 0);
-            StaticVarSet(svP + "Qty", 0);
-            StaticVarSet(svP + "FillPx", 0);
-            StaticVarSet(svP + "CurStop", 0);
-            StaticVarSet(svP + "TargetPx", 0);
-            StaticVarSet(svP + "CloseSent", 0);
-            StaticVarSet(svP + "VwapPhase", 0);
-            StaticVarSet(svP + "Consec1", 0);
-            StaticVarSet(svP + "Consec2", 0);
-            StaticVarSet(svP + "ConsecRev", 0);
-            StaticVarSet(svP + "OrphanCount", 0);
-            StaticVarSet(svP + "LongFillCnt", 0);
-            StaticVarSet(svP + "ShortFillCnt", 0);
-            StaticVarSet(svP + "LastSeenDT", 0);
-            // Leave DN untouched so NEW DAY RESET doesn't double-fire
-            if (DebugTrace)
-                _TRACE("!!! IB RESET TRACKING " + ibTicker +
-                    " - all OIDs cleared, StaticVars zeroed");
+            ibLastStopOIDReset = StaticVarGetText(svP + "LastStopOID");
+            ibLastTgtOIDReset  = StaticVarGetText(svP + "LastTargetOID");
+
+            // If TP already filled at the broker, cancel leftover stop(s)
+            // and clear tracking — do not rebuild a bracket on a closed trade.
+            // LastTargetOID alone is not enough (may be a prior trade's fill).
+            _rstTgtFilled = False;
+            if (ibTargetOID != "")
+                _rstTgtFilled = (ibc.GetStatus(ibTargetOID, True) == "Filled");
+            else if ((_rstPreFixed OR _rstPreCurTgt > 0) AND ibLastTgtOIDReset != "")
+                _rstTgtFilled = (ibc.GetStatus(ibLastTgtOIDReset, True) == "Filled");
+
+            if (ibLongOID != "")  ibc.CancelOrder(ibLongOID);
+            if (ibShortOID != "") ibc.CancelOrder(ibShortOID);
+
+            if (_rstTgtFilled)
+            {
+                if (ibStopOID != "")        ibc.CancelOrder(ibStopOID);
+                if (ibLastStopOIDReset != "" AND ibLastStopOIDReset != ibStopOID)
+                    ibc.CancelOrder(ibLastStopOIDReset);
+
+                ibLongOID = ""; ibShortOID = ""; ibStopOID = ""; ibTargetOID = "";
+                StaticVarSetText(svP + "LongOID", "");
+                StaticVarSetText(svP + "ShortOID", "");
+                StaticVarSetText(svP + "StopOID", "");
+                StaticVarSetText(svP + "LastStopOID", "");
+                StaticVarSetText(svP + "TargetOID", "");
+                StaticVarSetText(svP + "LastTargetOID", "");
+                StaticVarSet(svP + "CurTarget", 0);
+                StaticVarSet(svP + "FixedLmt", 0);
+                StaticVarSetText(svP + "EodCloseOID", "");
+                StaticVarSet(svP + "VwapPhase", 0);
+                StaticVarSet(svP + "Consec1", 0);
+                StaticVarSet(svP + "Consec2", 0);
+                StaticVarSet(svP + "ConsecRev", 0);
+                StaticVarSet(svP + "OrphanCount", 0);
+                StaticVarSet(svP + "AdoptLongSent", 0);
+                StaticVarSet(svP + "AdoptShortSent", 0);
+                StaticVarSetText(svP + "MktLongBar", "");
+                StaticVarSetText(svP + "MktShortBar", "");
+
+                if (ibPos != 0)
+                {
+                    // TP filled but IB position lag — suppress orphan/stop
+                    // rebuild until flat.
+                    StaticVarSet(svP + "CloseSent", 1);
+                    ibDir = 0;
+                    StaticVarSet(svP + "Dir", 0);
+                }
+                else
+                {
+                    StaticVarSet(svP + "CloseSent", 0);
+                    ibDir = 0;
+                    StaticVarSet(svP + "Dir", 0);
+                    StaticVarSet(svP + "Qty", 0);
+                    StaticVarSet(svP + "FillPx", 0);
+                    StaticVarSet(svP + "CurStop", 0);
+                    StaticVarSet(svP + "TargetPx", 0);
+                }
+
+                if (DebugTrace)
+                    _TRACE("!!! IB RESET TRACKING " + ibTicker +
+                        " - TP already FILLED; cancelled leftover stop(s), state cleared" +
+                        " ibPos=" + NumToStr(ibPos, 1.0));
+            }
+            else
+            {
+                if (ibStopOID != "")        ibc.CancelOrder(ibStopOID);
+                if (ibLastStopOIDReset != "" AND ibLastStopOIDReset != ibStopOID)
+                    ibc.CancelOrder(ibLastStopOIDReset);
+                if (ibTargetOID != "")      ibc.CancelOrder(ibTargetOID);
+                if (ibLastTgtOIDReset != "" AND ibLastTgtOIDReset != ibTargetOID)
+                    ibc.CancelOrder(ibLastTgtOIDReset);
+
+                ibLongOID = ""; ibShortOID = ""; ibStopOID = ""; ibTargetOID = "";
+                StaticVarSetText(svP + "LongOID", "");
+                StaticVarSetText(svP + "ShortOID", "");
+                StaticVarSetText(svP + "StopOID", "");
+                StaticVarSetText(svP + "LastStopOID", "");
+                StaticVarSetText(svP + "TargetOID", "");
+                StaticVarSetText(svP + "LastTargetOID", "");
+                StaticVarSet(svP + "CurTarget", 0);
+                StaticVarSet(svP + "FixedLmt", 0);
+                StaticVarSetText(svP + "EodCloseOID", "");
+                StaticVarSet(svP + "CloseSent", 0);
+                StaticVarSet(svP + "VwapPhase", 0);
+                StaticVarSet(svP + "Consec1", 0);
+                StaticVarSet(svP + "Consec2", 0);
+                StaticVarSet(svP + "ConsecRev", 0);
+                StaticVarSet(svP + "OrphanCount", 0);
+                StaticVarSet(svP + "LongFillCnt", 0);
+                StaticVarSet(svP + "ShortFillCnt", 0);
+                StaticVarSet(svP + "LastSeenDT", 0);
+                StaticVarSet(svP + "AdoptLongSent", 0);
+                StaticVarSet(svP + "AdoptShortSent", 0);
+                StaticVarSetText(svP + "MktLongBar", "");
+                StaticVarSetText(svP + "MktShortBar", "");
+
+                // Still in a broker position: re-seed Dir / entry / stop from IB
+                // Avg. cost so the entry line matches the real fill (not C[lb] /
+                // not the AFL synthetic PosEntry). Leave StopOID empty so the
+                // IN-POSITION heartbeat re-places the protective STP. Re-place
+                // fixed LMT TP immediately when the strategy uses one.
+                if (ibPos != 0)
+                {
+                    ibDir = IIf(ibPos > 0, 1, -1);
+                    StaticVarSet(svP + "Dir", ibDir);
+                    StaticVarSet(svP + "Qty", abs(ibPos));
+                    ibQtyStored = abs(ibPos);
+
+                    _rstAvg = ibc.GetPositionInfo(ibTicker, "Avg. cost");
+                    _rstFill = 0;
+                    if (NOT IsNull(_rstAvg) AND _rstAvg > 0)
+                        _rstFill = _rstAvg;
+                    else if (_rstPreFill > 0)
+                        _rstFill = _rstPreFill;
+                    else
+                        _rstFill = C[lb];
+                    StaticVarSet(svP + "FillPx", _rstFill);
+
+                    _rstStop = 0;
+                    if (_rstPreStop > 0)
+                    {
+                        if (ibDir == 1 AND _rstPreStop < _rstFill)
+                            _rstStop = _rstPreStop;
+                        else if (ibDir == -1 AND _rstPreStop > _rstFill)
+                            _rstStop = _rstPreStop;
+                    }
+                    if (_rstStop <= 0 AND ibStopDist > 0)
+                    {
+                        if (ibDir == 1)
+                            _rstStop = _rstFill - ibStopDist;
+                        else
+                            _rstStop = _rstFill + ibStopDist;
+                    }
+                    StaticVarSet(svP + "CurStop", _rstStop);
+
+                    _rstTgtPx = 0;
+                    if (_rstPreTgt > 0)
+                        _rstTgtPx = _rstPreTgt;
+                    else if (_rstTgtDist > 0 AND _rstFill > 0)
+                        _rstTgtPx = _rstFill + ibDir * _rstTgtDist;
+                    else if (_rstFill > 0 AND ibATR > 0)
+                        _rstTgtPx = _rstFill + ibDir * ibATR * AtrTargetMult;
+                    StaticVarSet(svP + "TargetPx", _rstTgtPx);
+
+                    // Fixed R-multiple LMT TP (zone strategies): place now so
+                    // a missing/cancelled target is restored with the stop.
+                    _rstPlaceFixedTp = (NOT ibUseVwapLmt
+                        AND (_rstTgtDist > 0 OR _rstPreFixed)
+                        AND _rstTgtPx > 0
+                        AND ibQtyStored > 0);
+                    if (_rstPlaceFixedTp)
+                    {
+                        _rstTgtSide = WriteIf(ibDir == 1, "SELL", "BUY");
+                        ibTargetOID = ibc.PlaceOrder(ibTicker, _rstTgtSide,
+                            ibQtyStored, "LMT", _rstTgtPx, 0, "DAY", True,
+                            IBTickSize);
+                        if (ibTargetOID != "")
+                        {
+                            StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                            StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                            StaticVarSet(svP + "CurTarget", _rstTgtPx);
+                            StaticVarSet(svP + "FixedLmt", 1);
+                            IbLogEvt(svP, "RESET FIXED LMT TP @" +
+                                NumToStr(_rstTgtPx, 1.4));
+                        }
+                        else if (DebugTrace)
+                            _TRACE("!!! IB RESET FIXED LMT TP FAILED " +
+                                ibTicker + " Px=" + NumToStr(_rstTgtPx, 1.4) +
+                                " - will retry via TP heartbeat");
+                    }
+
+                    if (DebugTrace)
+                        _TRACE("!!! IB RESET TRACKING " + ibTicker +
+                            " - OIDs cleared; open pos re-seeded" +
+                            " Dir=" + NumToStr(ibDir, 1.0) +
+                            " FillPx=" + NumToStr(_rstFill, 1.4) +
+                            " AvgCost=" + NumToStr(Nz(_rstAvg), 1.4) +
+                            " CurStop=" + NumToStr(_rstStop, 1.4) +
+                            " TargetPx=" + NumToStr(_rstTgtPx, 1.4) +
+                            " TargetOID=" + ibTargetOID +
+                            " FixedLmt=" + NumToStr(Nz(StaticVarGet(svP + "FixedLmt")), 1.0));
+                }
+                else
+                {
+                    ibDir = 0;
+                    StaticVarSet(svP + "Dir", 0);
+                    StaticVarSet(svP + "Qty", 0);
+                    StaticVarSet(svP + "FillPx", 0);
+                    StaticVarSet(svP + "CurStop", 0);
+                    StaticVarSet(svP + "TargetPx", 0);
+                    StaticVarSet(svP + "CurTarget", 0);
+                    StaticVarSet(svP + "FixedLmt", 0);
+                    // Leave DN untouched so NEW DAY RESET doesn't double-fire
+                    if (DebugTrace)
+                        _TRACE("!!! IB RESET TRACKING " + ibTicker +
+                            " - all OIDs cleared, StaticVars zeroed (flat)");
+                }
+            }
         }
 
         // ---- NEW DAY RESET ----
@@ -427,14 +646,18 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (ibLongOID != "")  ibc.CancelOrder(ibLongOID);
             if (ibShortOID != "") ibc.CancelOrder(ibShortOID);
             if (ibStopOID != "")  ibc.CancelOrder(ibStopOID);
+            if (ibTargetOID != "") ibc.CancelOrder(ibTargetOID);
 
-            ibLongOID = ""; ibShortOID = ""; ibStopOID = "";
+            ibLongOID = ""; ibShortOID = ""; ibStopOID = ""; ibTargetOID = "";
             ibDir = 0;
 
             StaticVarSetText(svP + "LongOID", "");
             StaticVarSetText(svP + "ShortOID", "");
             StaticVarSetText(svP + "StopOID", "");
             StaticVarSetText(svP + "LastStopOID", "");
+            StaticVarSetText(svP + "TargetOID", "");
+            StaticVarSetText(svP + "LastTargetOID", "");
+            StaticVarSet(svP + "CurTarget", 0);
             StaticVarSetText(svP + "EodCloseOID", "");
             StaticVarSet(svP + "Dir", 0);
             StaticVarSet(svP + "CloseSent", 0);
@@ -445,6 +668,10 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             StaticVarSet(svP + "OrphanCount", 0);
             StaticVarSet(svP + "LongFillCnt", 0);
             StaticVarSet(svP + "ShortFillCnt", 0);
+            StaticVarSet(svP + "AdoptLongSent", 0);
+            StaticVarSet(svP + "AdoptShortSent", 0);
+            StaticVarSetText(svP + "MktLongBar", "");
+            StaticVarSetText(svP + "MktShortBar", "");
             StaticVarSet(svP + "DN", ibDN);
 
             if (DebugTrace)
@@ -520,6 +747,15 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     ibStopOID = "";
                     StaticVarSetText(svP + "StopOID", "");
                 }
+                if (ibTargetOID != "")
+                {
+                    StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                    ibc.CancelOrder(ibTargetOID);
+                    ibTargetOID = "";
+                    StaticVarSetText(svP + "TargetOID", "");
+                    StaticVarSet(svP + "CurTarget", 0);
+                }
+                StaticVarSet(svP + "FixedLmt", 0);
             }
         }
 
@@ -613,20 +849,47 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     StaticVarSetText(svP + "StopOID", ibStopOID);
                     StaticVarSet(svP + "OrphanCount", 0);
                     if (Nz(StaticVarGet(svP + "FillPx")) <= 0)
-                        StaticVarSet(svP + "FillPx", C[lb]);
+                    {
+                        // Prefer IB portfolio Avg. cost (actual entry), not C.
+                        _orpAvg = ibc.GetPositionInfo(ibTicker, "Avg. cost");
+                        if (NOT IsNull(_orpAvg) AND _orpAvg > 0)
+                            StaticVarSet(svP + "FillPx", _orpAvg);
+                        else
+                            StaticVarSet(svP + "FillPx", C[lb]);
+                    }
 
                     if (DebugTrace)
                         _TRACE("!!! IB ORPHAN RE-ADOPTED " + ibTicker +
                             " Dir=" + NumToStr(ibDir, 1.0) +
                             " Qty=" + NumToStr(ibAbsRecov, 1.0) +
+                            " FillPx=" + NumToStr(Nz(StaticVarGet(svP + "FillPx")), 1.4) +
                             " ReusedStopOID=" + ibStopOID +
                             " Status=" + ibLastStopStatus);
                 }
                 else
                 {
                     // No live stop at broker - place a fresh one.
-                    // Prefer last known CurStop, fall back to ATR-based.
+                    // Seed entry from IB Avg. cost first so stop is anchored
+                    // to the real fill, not the current print.
+                    if (Nz(StaticVarGet(svP + "FillPx")) <= 0)
+                    {
+                        _orpAvg = ibc.GetPositionInfo(ibTicker, "Avg. cost");
+                        if (NOT IsNull(_orpAvg) AND _orpAvg > 0)
+                            StaticVarSet(svP + "FillPx", _orpAvg);
+                        else
+                            StaticVarSet(svP + "FillPx", C[lb]);
+                    }
+                    _ibRecovFill = Nz(StaticVarGet(svP + "FillPx"));
+
+                    // Prefer last known CurStop, fall back to ATR from fill.
                     ibRecovStop = Nz(StaticVarGet(svP + "CurStop"));
+                    if (ibRecovStop <= 0 AND _ibRecovFill > 0 AND ibStopDist > 0)
+                    {
+                        if (ibDir == 1)
+                            ibRecovStop = _ibRecovFill - ibStopDist;
+                        else
+                            ibRecovStop = _ibRecovFill + ibStopDist;
+                    }
                     if (ibRecovStop <= 0)
                     {
                         if (ibDir == 1)
@@ -647,14 +910,11 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         StaticVarSetText(svP + "StopOID", ibStopOID);
                         StaticVarSetText(svP + "LastStopOID", ibStopOID);
                         StaticVarSet(svP + "CurStop", ibRecovStop);
-                        if (Nz(StaticVarGet(svP + "FillPx")) <= 0)
-                            StaticVarSet(svP + "FillPx", C[lb]);
                         // Seed TargetPx for the overlay if we don't already
                         // have one (e.g. orphan recovery on a position that
                         // was opened before this AFL was tracking).
                         if (Nz(StaticVarGet(svP + "TargetPx")) <= 0)
                         {
-                            _ibRecovFill = Nz(StaticVarGet(svP + "FillPx"));
                             if (_ibRecovFill > 0 AND ibATR > 0)
                                 StaticVarSet(svP + "TargetPx",
                                     _ibRecovFill + ibDir * ibATR * AtrTargetMult);
@@ -720,10 +980,19 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             AND ((BarTotalMin[lb] >= ExitTimeTotalMin)
                  OR (ibNowTotalMin >= ExitTimeTotalMin));
 
+        // Blackout: same wall-clock OR as PastExit. Bar-only InBlackout[lb]
+        // can lag by a full bar on quiet names, leaving pullback LMTs live
+        // and fillable after the blackout window has started.
+        ibInBlackout = UseBlackout
+            AND (InBlackout[lb]
+                 OR (ibNowTotalMin >= BOStartTotalMin
+                     AND ibNowTotalMin < BOEndTotalMin));
+
         if (DebugVerbose)
             _TRACE("IB GATE " + ibTicker +
                 " CloseSent=" + NumToStr(ibCloseSent, 1.0) +
                 " PastExit=" + NumToStr(ibPastExit, 1.0) +
+                " Blackout=" + NumToStr(ibInBlackout, 1.0) +
                 " ibPos=" + NumToStr(ibPos, 1.0) +
                 " ibDir=" + NumToStr(ibDir, 1.0) +
                 " ORCalc=" + NumToStr(ORCalculated[lb], 1.0) +
@@ -751,14 +1020,22 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             // and a mismatch causes the call to cancel orders on OTHER
             // symbols, including their working protective stops.
             ibLastStopOIDEod = StaticVarGetText(svP + "LastStopOID");
+            ibLastTgtOIDEod  = StaticVarGetText(svP + "LastTargetOID");
             if (ibLongOID != "")  ibc.CancelOrder(ibLongOID);
             if (ibShortOID != "") ibc.CancelOrder(ibShortOID);
             if (ibLastStopOIDEod != "" AND ibLastStopOIDEod != ibStopOID)
                 ibc.CancelOrder(ibLastStopOIDEod);
+            if (ibTargetOID != "") ibc.CancelOrder(ibTargetOID);
+            if (ibLastTgtOIDEod != "" AND ibLastTgtOIDEod != ibTargetOID)
+                ibc.CancelOrder(ibLastTgtOIDEod);
             ibLongOID = "";
             ibShortOID = "";
+            ibTargetOID = "";
             StaticVarSetText(svP + "LongOID", "");
             StaticVarSetText(svP + "ShortOID", "");
+            StaticVarSetText(svP + "TargetOID", "");
+            StaticVarSetText(svP + "LastTargetOID", "");
+            StaticVarSet(svP + "CurTarget", 0);
 
             // If IB still reports a live position past exit time, retry
             // the close. This covers the case where the earlier MKT close
@@ -842,12 +1119,73 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         " (in flight or filled - debounce active)");
                 }
             }
-            else if (ibStopOID != "")
+            else if (ibStopOID != "" OR ibTargetOID != "")
             {
-                // Flat at IB but we still have a tracked stop -> clean up
-                ibc.CancelOrder(ibStopOID);
-                ibStopOID = "";
-                StaticVarSetText(svP + "StopOID", "");
+                // Flat at IB but we still have a tracked stop/target -> clean up
+                if (ibStopOID != "")
+                {
+                    ibc.CancelOrder(ibStopOID);
+                    ibStopOID = "";
+                    StaticVarSetText(svP + "StopOID", "");
+                }
+                if (ibTargetOID != "")
+                {
+                    ibc.CancelOrder(ibTargetOID);
+                    ibTargetOID = "";
+                    StaticVarSetText(svP + "TargetOID", "");
+                    StaticVarSet(svP + "CurTarget", 0);
+                }
+            }
+        }
+
+        // ---- BLACKOUT: cancel resting ENTRY orders only ----
+        // Protective STP / LMT TP stay live when already in a position.
+        // Skipped when PastExit already ran (that path owns full flatten).
+        // If the entry already Filled this refresh, leave the OID intact so
+        // FILL DETECTION can attach stop/TP (same race guard as FLAT cancel).
+        if (ibInBlackout AND NOT ibPastExit)
+        {
+            if (ibLongOID != "")
+            {
+                _boLSt = ibc.GetStatus(ibLongOID, True);
+                if (_boLSt == "Filled")
+                {
+                    if (DebugTrace)
+                        _TRACE("!!! IB BLACKOUT FILL RACE " + ibTicker +
+                            " LongOID=" + ibLongOID +
+                            " - cancel suppressed, FILL DETECTION will run");
+                }
+                else
+                {
+                    ibc.CancelOrder(ibLongOID);
+                    if (DebugTrace)
+                        _TRACE("!!! IB BLACKOUT cancel ENTRY " + ibTicker +
+                            " LongOID=" + ibLongOID);
+                    IbLogEvt(svP, "BLACKOUT cancel LONG ENTRY");
+                    ibLongOID = "";
+                    StaticVarSetText(svP + "LongOID", "");
+                }
+            }
+            if (ibShortOID != "")
+            {
+                _boSSt = ibc.GetStatus(ibShortOID, True);
+                if (_boSSt == "Filled")
+                {
+                    if (DebugTrace)
+                        _TRACE("!!! IB BLACKOUT FILL RACE " + ibTicker +
+                            " ShortOID=" + ibShortOID +
+                            " - cancel suppressed, FILL DETECTION will run");
+                }
+                else
+                {
+                    ibc.CancelOrder(ibShortOID);
+                    if (DebugTrace)
+                        _TRACE("!!! IB BLACKOUT cancel ENTRY " + ibTicker +
+                            " ShortOID=" + ibShortOID);
+                    IbLogEvt(svP, "BLACKOUT cancel SHORT ENTRY");
+                    ibShortOID = "";
+                    StaticVarSetText(svP + "ShortOID", "");
+                }
             }
         }
 
@@ -948,12 +1286,35 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     StaticVarSetText(svP + "LastStopOID", ibStopOID);
                     StaticVarSet(svP + "FillPx", ibFill);
                     StaticVarSet(svP + "CurStop", ibSL);
-                    // Record the ATR-based take-profit for the GFX overlay.
-                    // Not transmitted as a working order (this strategy uses
-                    // trailing stops + VWAP exits, not bracket limits), but
-                    // displaying it keeps the operator aware of the planned
-                    // R-multiple target.
-                    StaticVarSet(svP + "TargetPx", ibFill + (ibATR * AtrTargetMult));
+                    // Overlay / working target:
+                    //   VWAP LMT mode → seed VWAP (armed on touch later)
+                    //   Fixed LMT mode (TargetDistOverride) → resting LMT now
+                    //   else → ATR R-multiple hint (display only)
+                    _ibTgtDist = Nz(StaticVarGet(svP + "TargetDistOverride"));
+                    if (ibUseVwapLmt AND NOT IsNull(RthVwap[lb]) AND RthVwap[lb] > 0)
+                        StaticVarSet(svP + "TargetPx", RthVwap[lb]);
+                    else if (_ibTgtDist > 0)
+                        StaticVarSet(svP + "TargetPx", ibFill + _ibTgtDist);
+                    else
+                        StaticVarSet(svP + "TargetPx", ibFill + (ibATR * AtrTargetMult));
+
+                    // Fixed R-multiple LMT TP (zone strategies). Place now so
+                    // the bracket rests at the broker; first fill cancels STP.
+                    if (NOT ibUseVwapLmt AND _ibTgtDist > 0 AND ibTargetOID == "")
+                    {
+                        _ibTgtPx = ibFill + _ibTgtDist;
+                        ibTargetOID = ibc.PlaceOrder(ibTicker, "SELL", ibEntryQty,
+                            "LMT", _ibTgtPx, 0, "DAY", True, IBTickSize);
+                        if (ibTargetOID != "")
+                        {
+                            StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                            StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                            StaticVarSet(svP + "CurTarget", _ibTgtPx);
+                            StaticVarSet(svP + "FixedLmt", 1);
+                            ibJustArmedTarget = True;
+                            IbLogEvt(svP, "FIXED LMT TP @" + NumToStr(_ibTgtPx, 1.4));
+                        }
+                    }
 
                     StaticVarSet(svP + "VwapPhase", 0);
                     StaticVarSet(svP + "Consec1", 0);
@@ -1022,12 +1383,29 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     StaticVarSetText(svP + "LastStopOID", ibStopOID);
                     StaticVarSet(svP + "FillPx", ibFill);
                     StaticVarSet(svP + "CurStop", ibSL);
-                    // Record the ATR-based take-profit for the GFX overlay.
-                    // Not transmitted as a working order (this strategy uses
-                    // trailing stops + VWAP exits, not bracket limits), but
-                    // displaying it keeps the operator aware of the planned
-                    // R-multiple target.
-                    StaticVarSet(svP + "TargetPx", ibFill - (ibATR * AtrTargetMult));
+                    _ibTgtDist = Nz(StaticVarGet(svP + "TargetDistOverride"));
+                    if (ibUseVwapLmt AND NOT IsNull(RthVwap[lb]) AND RthVwap[lb] > 0)
+                        StaticVarSet(svP + "TargetPx", RthVwap[lb]);
+                    else if (_ibTgtDist > 0)
+                        StaticVarSet(svP + "TargetPx", ibFill - _ibTgtDist);
+                    else
+                        StaticVarSet(svP + "TargetPx", ibFill - (ibATR * AtrTargetMult));
+
+                    if (NOT ibUseVwapLmt AND _ibTgtDist > 0 AND ibTargetOID == "")
+                    {
+                        _ibTgtPx = ibFill - _ibTgtDist;
+                        ibTargetOID = ibc.PlaceOrder(ibTicker, "BUY", ibEntryQty,
+                            "LMT", _ibTgtPx, 0, "DAY", True, IBTickSize);
+                        if (ibTargetOID != "")
+                        {
+                            StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                            StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                            StaticVarSet(svP + "CurTarget", _ibTgtPx);
+                            StaticVarSet(svP + "FixedLmt", 1);
+                            ibJustArmedTarget = True;
+                            IbLogEvt(svP, "FIXED LMT TP @" + NumToStr(_ibTgtPx, 1.4));
+                        }
+                    }
 
                     StaticVarSet(svP + "VwapPhase", 0);
                     StaticVarSet(svP + "Consec1", 0);
@@ -1140,16 +1518,18 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             // (IB error 202 "Order was discarded"). So MKT caps on ACTUAL
             // fills (ibLongFillCnt), which only increment after a confirmed
             // fill -- a pending market order can never be prematurely capped.
-            ibCountLongOK  = IIf(EntryMethodParam == 0,
+            // MKT (0) and pullback LMT (3) cap on live fills only so a
+            // resting/pending entry is not cancelled by the backtest counter.
+            ibCountLongOK  = IIf(EntryMethodParam == 0 OR EntryMethodParam == 3,
                                  ibLongFillCnt  < MaxBreakNumber,
                                  ibEffectiveLongCnt  < MaxBreakNumber);
-            ibCountShortOK = IIf(EntryMethodParam == 0,
+            ibCountShortOK = IIf(EntryMethodParam == 0 OR EntryMethodParam == 3,
                                  ibShortFillCnt < MaxBreakNumber,
                                  ibEffectiveShortCnt < MaxBreakNumber);
 
             ibKeepLong = ibORCalcOK AND IsRTH[lb]
                 AND NOT PastExitTime[lb] AND WithinTimeFilter[lb]
-                AND NOT InBlackout[lb]
+                AND NOT ibInBlackout
                 AND NOT (EnableChoppyFilter AND ChoppyBlocked[lb])
                 AND EnableLong
                 AND (NOT EnablePrevDayVA OR PrevDayVA_LongOK[lb])
@@ -1162,7 +1542,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
 
             ibKeepShort = ibORCalcOK AND IsRTH[lb]
                 AND NOT PastExitTime[lb] AND WithinTimeFilter[lb]
-                AND NOT InBlackout[lb]
+                AND NOT ibInBlackout
                 AND NOT (EnableChoppyFilter AND ChoppyBlocked[lb])
                 AND EnableShort
                 AND (NOT EnablePrevDayVA OR PrevDayVA_ShortOK[lb])
@@ -1214,13 +1594,41 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             ibCloseConfShort = (lb >= 2)
                 AND (C[lb - 1] < ibORL)  AND (C[lb - 2] >= ibORL);
 
-            ibMktSigLong  = IIf(MktConfirmClose, ibCloseConfLong,  Buy[lb]);
-            ibMktSigShort = IIf(MktConfirmClose, ibCloseConfShort, Short[lb]);
+            // Adopt: AFL loop still holds an open synthetic trade (in_trade /
+            // PosDir) but IB is flat — common after chart reopen, missed MKT
+            // fill, or a false live exit. Buy[lb]/Short[lb] only pulse on the
+            // entry bar, so without adopt the chart never re-arms. Opt-in via
+            // EnableAflPositionAdopt (MR strategies); breakout strategies leave
+            // it off so a missed breakout is not chased mid-move.
+            // Latch prevents one adopt attempt from re-firing every refresh.
+            if (NOT in_trade)
+            {
+                StaticVarSet(svP + "AdoptLongSent", 0);
+                StaticVarSet(svP + "AdoptShortSent", 0);
+            }
+            ibAdoptEn = Nz(EnableAflPositionAdopt);
+            ibAdoptLong  = ibAdoptEn AND in_trade AND PosDir[lb] == 1
+                AND NOT Nz(StaticVarGet(svP + "AdoptLongSent"));
+            ibAdoptShort = ibAdoptEn AND in_trade AND PosDir[lb] == -1
+                AND NOT Nz(StaticVarGet(svP + "AdoptShortSent"));
+
+            ibMktSigLong  = IIf(MktConfirmClose, ibCloseConfLong,
+                                Buy[lb] OR ibAdoptLong);
+            ibMktSigShort = IIf(MktConfirmClose, ibCloseConfShort,
+                                Short[lb] OR ibAdoptShort);
+
+            // Pullback LMT entry (method 3) — strategy publishes armed flag +
+            // limit price (e.g. SZDZ near edge of base). Independent of OR
+            // inside-gate and of Buy[lb] (avoids IQFeed wick → MKT).
+            ibLmtArmedLong  = Nz(StaticVarGet(svP + "LmtArmedLong"));
+            ibLmtArmedShort = Nz(StaticVarGet(svP + "LmtArmedShort"));
+            ibLmtPxLong     = Nz(StaticVarGet(svP + "LmtPxLong"));
+            ibLmtPxShort    = Nz(StaticVarGet(svP + "LmtPxShort"));
 
             // Breakout-candle volume confirmation for MKT/close-confirm mode.
             // V[lb-1] is the completed confirming bar (the actual breakout candle).
-            // Not applied to STP/STPLMT: those orders are placed before the breakout
-            // candle forms, so the volume is unknown at placement time.
+            // Not applied to STP/STPLMT/LMT: those orders are placed before the
+            // breakout/retrace candle forms, so volume is unknown at placement.
             ibBoVolLong  = NOT EnableBreakoutVolFilter
                 OR (lb < 1) OR (AvgORBarVol[lb] <= 0)
                 OR (V[lb - 1] >= BreakoutVolMult * AvgORBarVol[lb]);
@@ -1228,12 +1636,21 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 OR (lb < 1) OR (AvgORBarVol[lb] <= 0)
                 OR (V[lb - 1] >= BreakoutVolMult * AvgORBarVol[lb]);
 
-            ibArmLong  = IIf(EntryMethodParam == 0,
-                             ibKeepLong  AND ibMktSigLong  AND ibBoVolLong,
-                             ibCanLong);
-            ibArmShort = IIf(EntryMethodParam == 0,
-                             ibKeepShort AND ibMktSigShort AND ibBoVolShort,
-                             ibCanShort);
+            if (EntryMethodParam == 0)
+            {
+                ibArmLong  = ibKeepLong  AND ibMktSigLong  AND ibBoVolLong;
+                ibArmShort = ibKeepShort AND ibMktSigShort AND ibBoVolShort;
+            }
+            else if (EntryMethodParam == 3)
+            {
+                ibArmLong  = ibKeepLong  AND ibLmtArmedLong  AND ibLmtPxLong > 0;
+                ibArmShort = ibKeepShort AND ibLmtArmedShort AND ibLmtPxShort > 0;
+            }
+            else
+            {
+                ibArmLong  = ibCanLong;
+                ibArmShort = ibCanShort;
+            }
 
             // ---- Live entry-gate diagnostic (rendered on the chart Title) ----
             // Lists, for the CURRENT refresh, exactly which filters are
@@ -1245,7 +1662,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT IsRTH[lb])                                 _gL = _gL + " RTH";
             if (PastExitTime[lb])                              _gL = _gL + " PastExit";
             if (NOT WithinTimeFilter[lb])                      _gL = _gL + " TimeFilt";
-            if (InBlackout[lb])                                _gL = _gL + " Blackout";
+            if (ibInBlackout)                                  _gL = _gL + " Blackout";
             if (EnableChoppyFilter AND ChoppyBlocked[lb])      _gL = _gL + " Chop";
             if (NOT EnableLong)                                _gL = _gL + " LongOff";
             if (EnablePrevDayVA AND NOT PrevDayVA_LongOK[lb])  _gL = _gL + " PDVA";
@@ -1254,10 +1671,17 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT ibORWidthAtrOK)                            _gL = _gL + " ORWidth";
             if (NOT ibPortfolioOK)                             _gL = _gL + " PortCap";
             if (EntryMethodParam == 0 AND NOT ibMktSigLong)    _gL = _gL +
-                WriteIf(MktConfirmClose, " NoCloseAbove", " NoBreakUp");
+                WriteIf(MktConfirmClose, " NoCloseAbove",
+                  WriteIf(in_trade AND PosDir[lb] == 1, " AflHoldNoAdopt", " NoBreakUp"));
             if (EntryMethodParam == 0 AND NOT ibBoVolLong)     _gL = _gL + " BreakVol";
-            if (EntryMethodParam != 0 AND NOT ibInsideOR_Long) _gL = _gL + " OutsideOR";
-            ibGateLong = WriteIf(ibArmLong, "ARMED",
+            if (EntryMethodParam == 3 AND NOT ibLmtArmedLong)  _gL = _gL + " NoZoneArm";
+            if (EntryMethodParam == 3 AND ibLmtArmedLong AND NOT (ibLmtPxLong > 0))
+                                                              _gL = _gL + " NoLmtPx";
+            if (EntryMethodParam != 0 AND EntryMethodParam != 3 AND NOT ibInsideOR_Long)
+                                                              _gL = _gL + " OutsideOR";
+            ibGateLong = WriteIf(ibArmLong,
+                            WriteIf(ibAdoptLong AND NOT Buy[lb], "ARMED-ADOPT",
+                              WriteIf(EntryMethodParam == 3, "ARMED-LMT", "ARMED")),
                             "BLOCKED:" + WriteIf(_gL == "", " ?", _gL));
 
             _gS = "";
@@ -1265,7 +1689,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT IsRTH[lb])                                  _gS = _gS + " RTH";
             if (PastExitTime[lb])                               _gS = _gS + " PastExit";
             if (NOT WithinTimeFilter[lb])                       _gS = _gS + " TimeFilt";
-            if (InBlackout[lb])                                 _gS = _gS + " Blackout";
+            if (ibInBlackout)                                   _gS = _gS + " Blackout";
             if (EnableChoppyFilter AND ChoppyBlocked[lb])       _gS = _gS + " Chop";
             if (NOT EnableShort)                                _gS = _gS + " ShortOff";
             if (EnablePrevDayVA AND NOT PrevDayVA_ShortOK[lb])  _gS = _gS + " PDVA";
@@ -1274,10 +1698,17 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT ibORWidthAtrOK)                             _gS = _gS + " ORWidth";
             if (NOT ibPortfolioOK)                              _gS = _gS + " PortCap";
             if (EntryMethodParam == 0 AND NOT ibMktSigShort)    _gS = _gS +
-                WriteIf(MktConfirmClose, " NoCloseBelow", " NoBreakDn");
+                WriteIf(MktConfirmClose, " NoCloseBelow",
+                  WriteIf(in_trade AND PosDir[lb] == -1, " AflHoldNoAdopt", " NoBreakDn"));
             if (EntryMethodParam == 0 AND NOT ibBoVolShort)     _gS = _gS + " BreakVol";
-            if (EntryMethodParam != 0 AND NOT ibInsideOR_Short) _gS = _gS + " OutsideOR";
-            ibGateShort = WriteIf(ibArmShort, "ARMED",
+            if (EntryMethodParam == 3 AND NOT ibLmtArmedShort)  _gS = _gS + " NoZoneArm";
+            if (EntryMethodParam == 3 AND ibLmtArmedShort AND NOT (ibLmtPxShort > 0))
+                                                               _gS = _gS + " NoLmtPx";
+            if (EntryMethodParam != 0 AND EntryMethodParam != 3 AND NOT ibInsideOR_Short)
+                                                               _gS = _gS + " OutsideOR";
+            ibGateShort = WriteIf(ibArmShort,
+                            WriteIf(ibAdoptShort AND NOT Short[lb], "ARMED-ADOPT",
+                              WriteIf(EntryMethodParam == 3, "ARMED-LMT", "ARMED")),
                             "BLOCKED:" + WriteIf(_gS == "", " ?", _gS));
 
             // One-shot trace when the portfolio cap is the gate that's
@@ -1372,6 +1803,24 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             // alone -- once the order is at the OR boundary, leaving it
             // active while price tests that boundary is the entire point
             // of the strategy.
+            //
+            // Method 3: debounce NoZoneArm cancels — one refresh where
+            // LmtArmed drops (IQFeed wick / AFL touch) must not cancel a
+            // resting pullback LMT. Need 3 consecutive misses (~3s) or a
+            // hard session-gate failure (NOT ibKeepLong).
+            if (EntryMethodParam == 3)
+            {
+                if (ibLmtArmedLong)
+                    StaticVarSet(svP + "LmtMissLong", 0);
+                else if (ibLongOID != "")
+                    StaticVarSet(svP + "LmtMissLong",
+                        Nz(StaticVarGet(svP + "LmtMissLong")) + 1);
+                ibCancelLmtLong = NOT ibKeepLong
+                    OR Nz(StaticVarGet(svP + "LmtMissLong")) >= 3;
+            }
+            else
+                ibCancelLmtLong = NOT ibKeepLong;
+
             if (ibArmLong AND ibLongOID == "")
             {
                 ibOffset = ibATR * StpLmtAtrFactor;
@@ -1388,6 +1837,15 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         "STP", 0, ibORH,
                         "DAY", AutoTradeTransmit, IBTickSize);
                 }
+                else if (EntryMethodParam == 3)
+                {
+                    // Resting buy limit at strategy pullback level (near edge).
+                    ibLongOID = ibc.PlaceOrder(ibTicker, "BUY", ibQty,
+                        "LMT", ibLmtPxLong, 0,
+                        "DAY", AutoTradeTransmit, IBTickSize);
+                    if (ibLongOID != "")
+                        StaticVarSet(svP + "LmtPxWorkingLong", ibLmtPxLong);
+                }
                 else   // EntryMethodParam == 0 (MKT) -- Buy[lb] gated by ibArmLong
                 {
                     // Same-bar guard: don't fire a second market order on a
@@ -1399,7 +1857,11 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         ibLongOID = ibc.PlaceOrder(ibTicker, "BUY", ibQty,
                             "MKT", 0, 0, "DAY", True, IBTickSize);
                         if (ibLongOID != "")
+                        {
                             StaticVarSetText(svP + "MktLongBar", _ibMktLongBar);
+                            if (ibAdoptLong AND NOT Buy[lb])
+                                StaticVarSet(svP + "AdoptLongSent", 1);
+                        }
                     }
                 }
 
@@ -1411,12 +1873,30 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     IbLogEvt(svP, "LONG ENTRY sent " +
                         WriteIf(EntryMethodParam == 2, "STPLMT",
                           WriteIf(EntryMethodParam == 1, "STP",
-                            "MKT" + WriteIf(MktConfirmClose, "-close", "-intra"))) +
+                            WriteIf(EntryMethodParam == 3, "LMT@" + NumToStr(ibLmtPxLong, 1.4),
+                              "MKT" + WriteIf(ibAdoptLong AND NOT Buy[lb], "-adopt",
+                                WriteIf(MktConfirmClose, "-close", "-intra"))))) +
                         " qty=" + NumToStr(ibQty, 1.0) +
                         " @" + DateTimeToStr(dt[lb]));
                 }
             }
-            else if (NOT ibKeepLong AND ibLongOID != "")
+            else if (EntryMethodParam == 3 AND ibLongOID != "" AND ibLmtArmedLong
+                AND ibLmtPxLong > 0
+                AND abs(ibLmtPxLong - Nz(StaticVarGet(svP + "LmtPxWorkingLong"))) >= 0.01)
+            {
+                // Zone near-edge updated — replace working limit price.
+                _ibLmtModQty = IIf(ibQtyStored > 0, ibQtyStored, ibQty);
+                ibModRet = ibc.ModifyOrder(ibLongOID, ibTicker, "BUY", _ibLmtModQty,
+                    "LMT", ibLmtPxLong, 0, "DAY", AutoTradeTransmit, IBTickSize);
+                if (ibModRet != "")
+                {
+                    ibLongOID = ibModRet;
+                    StaticVarSetText(svP + "LongOID", ibLongOID);
+                    StaticVarSet(svP + "LmtPxWorkingLong", ibLmtPxLong);
+                    IbLogEvt(svP, "LONG LMT modify @" + NumToStr(ibLmtPxLong, 1.4));
+                }
+            }
+            else if (ibCancelLmtLong AND ibLongOID != "")
             {
                 // STATUS-CHECK GUARD: if the entry already filled this same
                 // refresh, do NOT cancel and do NOT clear the OID. Leaving
@@ -1453,6 +1933,19 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             }
 
             // ---- Short entry order ----
+            if (EntryMethodParam == 3)
+            {
+                if (ibLmtArmedShort)
+                    StaticVarSet(svP + "LmtMissShort", 0);
+                else if (ibShortOID != "")
+                    StaticVarSet(svP + "LmtMissShort",
+                        Nz(StaticVarGet(svP + "LmtMissShort")) + 1);
+                ibCancelLmtShort = NOT ibKeepShort
+                    OR Nz(StaticVarGet(svP + "LmtMissShort")) >= 3;
+            }
+            else
+                ibCancelLmtShort = NOT ibKeepShort;
+
             if (ibArmShort AND ibShortOID == "")
             {
                 ibOffset = ibATR * StpLmtAtrFactor;
@@ -1469,6 +1962,15 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         "STP", 0, ibORL,
                         "DAY", AutoTradeTransmit, IBTickSize);
                 }
+                else if (EntryMethodParam == 3)
+                {
+                    // Resting sell limit at strategy pullback level (near edge).
+                    ibShortOID = ibc.PlaceOrder(ibTicker, "SELL", ibQty,
+                        "LMT", ibLmtPxShort, 0,
+                        "DAY", AutoTradeTransmit, IBTickSize);
+                    if (ibShortOID != "")
+                        StaticVarSet(svP + "LmtPxWorkingShort", ibLmtPxShort);
+                }
                 else   // EntryMethodParam == 0 (MKT) -- Short[lb] gated by ibArmShort
                 {
                     // Same-bar guard (mirror of the long side above).
@@ -1478,7 +1980,11 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         ibShortOID = ibc.PlaceOrder(ibTicker, "SELL", ibQty,
                             "MKT", 0, 0, "DAY", True, IBTickSize);
                         if (ibShortOID != "")
+                        {
                             StaticVarSetText(svP + "MktShortBar", _ibMktShortBar);
+                            if (ibAdoptShort AND NOT Short[lb])
+                                StaticVarSet(svP + "AdoptShortSent", 1);
+                        }
                     }
                 }
 
@@ -1490,12 +1996,29 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     IbLogEvt(svP, "SHORT ENTRY sent " +
                         WriteIf(EntryMethodParam == 2, "STPLMT",
                           WriteIf(EntryMethodParam == 1, "STP",
-                            "MKT" + WriteIf(MktConfirmClose, "-close", "-intra"))) +
+                            WriteIf(EntryMethodParam == 3, "LMT@" + NumToStr(ibLmtPxShort, 1.4),
+                              "MKT" + WriteIf(ibAdoptShort AND NOT Short[lb], "-adopt",
+                                WriteIf(MktConfirmClose, "-close", "-intra"))))) +
                         " qty=" + NumToStr(ibQty, 1.0) +
                         " @" + DateTimeToStr(dt[lb]));
                 }
             }
-            else if (NOT ibKeepShort AND ibShortOID != "")
+            else if (EntryMethodParam == 3 AND ibShortOID != "" AND ibLmtArmedShort
+                AND ibLmtPxShort > 0
+                AND abs(ibLmtPxShort - Nz(StaticVarGet(svP + "LmtPxWorkingShort"))) >= 0.01)
+            {
+                _ibLmtModQty = IIf(ibQtyStored > 0, ibQtyStored, ibQty);
+                ibModRet = ibc.ModifyOrder(ibShortOID, ibTicker, "SELL", _ibLmtModQty,
+                    "LMT", ibLmtPxShort, 0, "DAY", AutoTradeTransmit, IBTickSize);
+                if (ibModRet != "")
+                {
+                    ibShortOID = ibModRet;
+                    StaticVarSetText(svP + "ShortOID", ibShortOID);
+                    StaticVarSet(svP + "LmtPxWorkingShort", ibLmtPxShort);
+                    IbLogEvt(svP, "SHORT LMT modify @" + NumToStr(ibLmtPxShort, 1.4));
+                }
+            }
+            else if (ibCancelLmtShort AND ibShortOID != "")
             {
                 // STATUS-CHECK GUARD (mirror of the long-side guard above):
                 // if the short entry already filled this same refresh,
@@ -1596,6 +2119,125 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 }
             }
 
+            // ---- TP-FILLED → CANCEL LEFTOVER STOP ----
+            // If the take-profit already filled but tracking lost TargetOID
+            // (or reset/reconnect left the STP live), cancel the protective
+            // stop immediately so it cannot fire against a flat/closing book.
+            // LastTargetOID is only consulted while this trade still expects
+            // a bracket TP (FixedLmt / CurTarget) — avoids a prior trade's
+            // filled OID cancelling a brand-new protective stop.
+            if (ibDir != 0 AND NOT Nz(StaticVarGet(svP + "CloseSent")))
+            {
+                _tpFillOid = "";
+                if (ibTargetOID != ""
+                    AND ibc.GetStatus(ibTargetOID, True) == "Filled")
+                    _tpFillOid = ibTargetOID;
+                else if (Nz(StaticVarGet(svP + "FixedLmt"))
+                    OR Nz(StaticVarGet(svP + "CurTarget")) > 0)
+                {
+                    _tpLastOid = StaticVarGetText(svP + "LastTargetOID");
+                    if (_tpLastOid != "" AND _tpLastOid != ibTargetOID
+                        AND ibc.GetStatus(_tpLastOid, True) == "Filled")
+                        _tpFillOid = _tpLastOid;
+                }
+
+                if (_tpFillOid != "")
+                {
+                    StaticVarSetText(svP + "LastTargetOID", _tpFillOid);
+                    ibLastStopOIDTgt = StaticVarGetText(svP + "LastStopOID");
+                    if (ibStopOID != "")
+                    {
+                        ibc.CancelOrder(ibStopOID);
+                        if (DebugTrace)
+                            _TRACE("!!! IB TP FILLED - cancel leftover stop " +
+                                ibTicker + " StopOID=" + ibStopOID +
+                                " TargetOID=" + _tpFillOid);
+                        ibStopOID = "";
+                        StaticVarSetText(svP + "StopOID", "");
+                    }
+                    if (ibLastStopOIDTgt != "" AND ibLastStopOIDTgt != ibStopOID)
+                        ibc.CancelOrder(ibLastStopOIDTgt);
+
+                    ibTargetOID = "";
+                    StaticVarSetText(svP + "TargetOID", "");
+                    StaticVarSet(svP + "CurTarget", 0);
+                    StaticVarSet(svP + "FixedLmt", 0);
+
+                    if (ibPos == 0)
+                    {
+                        ibDir = 0;
+                        StaticVarSet(svP + "Dir", 0);
+                        StaticVarSet(svP + "CloseSent", 0);
+                        StaticVarSet(svP + "OrphanCount", 0);
+                    }
+                    else
+                    {
+                        StaticVarSet(svP + "CloseSent", 1);
+                        ibDir = 0;
+                        StaticVarSet(svP + "Dir", 0);
+                    }
+                }
+            }
+
+            // ---- FIXED LMT TP HEARTBEAT ----
+            // Mirror of STOP HEARTBEAT for zone / R-multiple brackets: if we
+            // are in a position that should have a resting LMT TP but none is
+            // tracked, place it now (covers failed PlaceOrder on fill, manual
+            // cancel, or RESET rebuild races).
+            _ibTgtDistHb = Nz(StaticVarGet(svP + "TargetDistOverride"));
+            ibUseFixedLmtHb = Nz(StaticVarGet(svP + "FixedLmt"));
+            if (ibDir != 0 AND NOT ibUseVwapLmt
+                AND (_ibTgtDistHb > 0 OR ibUseFixedLmtHb)
+                AND ibTargetOID == "" AND NOT ibJustFilled
+                AND ibAbsPos > 0 AND NOT Nz(StaticVarGet(svP + "CloseSent")))
+            {
+                ibHbTgt = Nz(StaticVarGet(svP + "CurTarget"));
+                if (ibHbTgt <= 0)
+                    ibHbTgt = Nz(StaticVarGet(svP + "TargetPx"));
+                if (ibHbTgt <= 0)
+                {
+                    ibHbFill = Nz(StaticVarGet(svP + "FillPx"));
+                    if (ibHbFill <= 0) ibHbFill = C[lb];
+                    if (_ibTgtDistHb > 0)
+                        ibHbTgt = ibHbFill + ibDir * _ibTgtDistHb;
+                    else if (ibATR > 0)
+                        ibHbTgt = ibHbFill + ibDir * ibATR * AtrTargetMult;
+                }
+
+                ibHbTgtSide = "";
+                if (ibDir == 1)  ibHbTgtSide = "SELL";
+                else if (ibDir == -1) ibHbTgtSide = "BUY";
+
+                if (ibHbTgtSide != "" AND ibHbTgt > 0)
+                {
+                    ibHbTgtOID = ibc.PlaceOrder(ibTicker, ibHbTgtSide, ibAbsPos,
+                        "LMT", ibHbTgt, 0, "DAY", True, IBTickSize);
+                    if (ibHbTgtOID != "")
+                    {
+                        ibTargetOID = ibHbTgtOID;
+                        StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                        StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                        StaticVarSet(svP + "CurTarget", ibHbTgt);
+                        StaticVarSet(svP + "TargetPx", ibHbTgt);
+                        StaticVarSet(svP + "FixedLmt", 1);
+                        IbLogEvt(svP, "FIXED LMT TP HEARTBEAT @" +
+                            NumToStr(ibHbTgt, 1.4));
+                        if (DebugTrace)
+                            _TRACE("!!! IB TP HEARTBEAT FIRED " + ibTicker +
+                                " Dir=" + NumToStr(ibDir, 1.0) +
+                                " Qty=" + NumToStr(ibAbsPos, 1.0) +
+                                " TargetPx=" + NumToStr(ibHbTgt, 1.4) +
+                                " TargetOID=" + ibTargetOID);
+                    }
+                    else if (DebugTrace)
+                        _TRACE("!!! IB TP HEARTBEAT FAILED " + ibTicker +
+                            " Dir=" + NumToStr(ibDir, 1.0) +
+                            " Qty=" + NumToStr(ibAbsPos, 1.0) +
+                            " TargetPx=" + NumToStr(ibHbTgt, 1.4) +
+                            " - PlaceOrder returned empty, will retry next refresh");
+                }
+            }
+
             ibExit = False;
 
             // 1. Timed exit (always active). Fire on EITHER the last bar's
@@ -1606,35 +2248,26 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                      OR (ibNowTotalMin >= ExitTimeTotalMin)))
                 ibExit = True;
 
-            // 2-4 only apply when NOT using VWAP trailing exit.
-            // When VWAP trailing is active, the broker-side stop order
-            // handles exits — AFL Sell/Cover signals reflect the backtest's
-            // independent trailing stop which may differ from the IB order.
-            if (NOT UseRthVwapExit)
+            // 2-3 only apply when NOT using VWAP trailing exit and NOT using
+            // a resting LMT take-profit (VWAP bracket or fixed R-multiple).
+            // Broker-side STP/LMT handles those exits; AFL Sell/Cover must
+            // not force a MKT flatten that races the resting orders.
+            ibUseFixedLmt = Nz(StaticVarGet(svP + "FixedLmt"));
+            if (NOT UseRthVwapExit AND NOT ibUseVwapLmt AND NOT ibUseFixedLmt)
             {
-                // 2. AFL exit signal on current bar
-                if (ibDir == 1 AND Sell[lb])   ibExit = True;
-                if (ibDir == -1 AND Cover[lb]) ibExit = True;
+                // 2. AFL exit on current bar — ignore when this bar is also a
+                // new entry. The backtest loop can Sell/Cover a prior trade
+                // and Buy/Short a new one on the same bar; honoring the exit
+                // alone would flatten the just-filled live position.
+                if (ibDir == 1 AND Sell[lb] AND NOT Buy[lb])    ibExit = True;
+                if (ibDir == -1 AND Cover[lb] AND NOT Short[lb]) ibExit = True;
 
-                // 3. Backtest already exited on a prior bar
+                // 3. Backtest already flat — sync IB (missed exit on a prior bar).
+                // Do not use a raw Sell/Cover lookback: a Cover from a prior
+                // trade within N bars falsely exits a new MR hold that is
+                // still in_trade waiting for VWAP / target.
                 if (NOT ibExit AND ibDir != 0 AND NOT in_trade AND ibORCalcOK)
                     ibExit = True;
-
-                // 4. Lookback: catch exit signals on recent bars
-                if (NOT ibExit AND ibDir == 1)
-                {
-                    for (j = lb; j >= Max(0, lb - 5); j--)
-                    {
-                        if (Sell[j]) { ibExit = True; break; }
-                    }
-                }
-                if (NOT ibExit AND ibDir == -1)
-                {
-                    for (j = lb; j >= Max(0, lb - 5); j--)
-                    {
-                        if (Cover[j]) { ibExit = True; break; }
-                    }
-                }
             }
 
             if (ibExit)
@@ -1655,19 +2288,27 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 if (ibCloseSide != "" AND ibCloseQty > 0)
                 {
                     // Cancel any lingering orders for THIS SYMBOL FIRST
-                    // (stop, unfilled entry variants, stale STPLMT, etc.)
+                    // (stop, VWAP LMT target, unfilled entry variants, etc.)
                     // so the closing MKT can go through cleanly. Cancel
                     // explicitly by OID -- the IBController ticker filter
                     // on CancelAllPendingOrders is unreliable and can
                     // touch other symbols' working stops.
                     ibLastStopOIDExit = StaticVarGetText(svP + "LastStopOID");
+                    ibLastTgtOIDExit  = StaticVarGetText(svP + "LastTargetOID");
                     if (ibStopOID != "")    ibc.CancelOrder(ibStopOID);
+                    if (ibTargetOID != "")  ibc.CancelOrder(ibTargetOID);
                     if (ibLongOID != "")    ibc.CancelOrder(ibLongOID);
                     if (ibShortOID != "")   ibc.CancelOrder(ibShortOID);
                     if (ibLastStopOIDExit != "" AND ibLastStopOIDExit != ibStopOID)
                         ibc.CancelOrder(ibLastStopOIDExit);
+                    if (ibLastTgtOIDExit != "" AND ibLastTgtOIDExit != ibTargetOID)
+                        ibc.CancelOrder(ibLastTgtOIDExit);
                     ibStopOID = "";
                     StaticVarSetText(svP + "StopOID", "");
+                    ibTargetOID = "";
+                    StaticVarSetText(svP + "TargetOID", "");
+                    StaticVarSetText(svP + "LastTargetOID", "");
+                    StaticVarSet(svP + "CurTarget", 0);
                     ibLongOID = "";
                     StaticVarSetText(svP + "LongOID", "");
                     ibShortOID = "";
@@ -1712,6 +2353,13 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                         ibc.CancelOrder(ibStopOID);
                         ibStopOID = "";
                         StaticVarSetText(svP + "StopOID", "");
+                    }
+                    if (ibTargetOID != "")
+                    {
+                        ibc.CancelOrder(ibTargetOID);
+                        ibTargetOID = "";
+                        StaticVarSetText(svP + "TargetOID", "");
+                        StaticVarSet(svP + "CurTarget", 0);
                     }
                     StaticVarSet(svP + "CloseSent", 1);
                     ibDir = 0;
@@ -1998,17 +2646,201 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 }
                 } // end if ibStopOID active check
             }
+            else if ((ibUseVwapLmt OR Nz(StaticVarGet(svP + "FixedLmt"))) AND ibDir != 0)
+            {
+                // ============================================================
+                // BRACKET LMT TAKE-PROFIT
+                // Protective STP stays live. VWAP mode: arm LMT on first VWAP
+                // touch and chase. Fixed mode (TargetDistOverride): LMT already
+                // placed at fill. First fill (stop OR target) cancels sibling.
+                // ============================================================
+                ibUseFixedLmt = Nz(StaticVarGet(svP + "FixedLmt"));
+                ibVwapNow = RthVwap[lb];
+                ibCurTarget = Nz(StaticVarGet(svP + "CurTarget"));
+
+                // ---- Target fill / terminal ----
+                if (ibTargetOID != "")
+                {
+                    ibTgtSt = ibc.GetStatus(ibTargetOID, True);
+                    ibTgtFilled = (ibTgtSt == "Filled");
+                    ibTgtTerminal = (ibTgtFilled
+                        OR ibTgtSt == "Cancelled"
+                        OR ibTgtSt == "ApiCancelled"
+                        OR ibTgtSt == "Inactive");
+
+                    if (ibTgtFilled)
+                    {
+                        StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+
+                        // Cancel protective stop (sibling)
+                        ibLastStopOIDTgt = StaticVarGetText(svP + "LastStopOID");
+                        if (ibStopOID != "")
+                        {
+                            ibc.CancelOrder(ibStopOID);
+                            if (DebugTrace)
+                                _TRACE("IB LMT TP FILLED - cancel stop " +
+                                    ibTicker + " StopOID=" + ibStopOID);
+                            ibStopOID = "";
+                            StaticVarSetText(svP + "StopOID", "");
+                        }
+                        if (ibLastStopOIDTgt != "" AND ibLastStopOIDTgt != ibStopOID)
+                            ibc.CancelOrder(ibLastStopOIDTgt);
+
+                        if (ibPos == 0)
+                        {
+                            ibDir = 0;
+                            ibTargetOID = "";
+                            StaticVarSet(svP + "Dir", 0);
+                            StaticVarSet(svP + "CloseSent", 0);
+                            StaticVarSet(svP + "OrphanCount", 0);
+                            StaticVarSetText(svP + "TargetOID", "");
+                            StaticVarSet(svP + "CurTarget", 0);
+                            StaticVarSet(svP + "FixedLmt", 0);
+                            if (DebugTrace)
+                                _TRACE("IB LMT TP FILLED + FLAT " + ibTicker +
+                                    " - state cleared");
+                        }
+                        else
+                        {
+                            if (DebugTrace)
+                                _TRACE("IB LMT TP FILLED BUT POS OPEN " +
+                                    ibTicker + " ibPos=" + NumToStr(ibPos, 1.0) +
+                                    " - CloseSent, awaiting sync");
+                            StaticVarSet(svP + "CloseSent", 1);
+                            ibTargetOID = "";
+                            StaticVarSetText(svP + "TargetOID", "");
+                            StaticVarSet(svP + "CurTarget", 0);
+                            StaticVarSet(svP + "FixedLmt", 0);
+                        }
+                    }
+                    else if (ibTgtTerminal)
+                    {
+                        // Cancelled externally — clear slot so we can re-arm
+                        if (DebugTrace)
+                            _TRACE("IB LMT TP TERMINAL " + ibTicker +
+                                " OID=" + ibTargetOID + " Status=" + ibTgtSt +
+                                " - clearing TargetOID for re-arm");
+                        StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                        ibTargetOID = "";
+                        StaticVarSetText(svP + "TargetOID", "");
+                        StaticVarSet(svP + "CurTarget", 0);
+                        ibCurTarget = 0;
+                        // Fixed LMT is not re-armed on touch; clear flag.
+                        if (ibUseFixedLmt)
+                            StaticVarSet(svP + "FixedLmt", 0);
+                    }
+                }
+
+                // ---- Arm / chase (VWAP mode only) ----
+                if (ibUseVwapLmt AND NOT ibUseFixedLmt
+                    AND ibDir != 0 AND NOT IsNull(ibVwapNow) AND ibVwapNow > 0
+                    AND ibAbsPos > 0 AND NOT Nz(StaticVarGet(svP + "CloseSent")))
+                {
+                    ibArmTouch = False;
+                    if (ibDir == 1 AND H[lb] >= ibVwapNow) ibArmTouch = True;
+                    if (ibDir == -1 AND L[lb] <= ibVwapNow) ibArmTouch = True;
+
+                    ibTgtSide = "";
+                    if (ibDir == 1) ibTgtSide = "SELL";
+                    else if (ibDir == -1) ibTgtSide = "BUY";
+
+                    if (ibTargetOID == "" AND ibArmTouch AND ibTgtSide != "")
+                    {
+                        ibTargetOID = ibc.PlaceOrder(ibTicker, ibTgtSide, ibAbsPos,
+                            "LMT", ibVwapNow, 0, "DAY", True, IBTickSize);
+                        if (ibTargetOID != "")
+                        {
+                            StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                            StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                            StaticVarSet(svP + "CurTarget", ibVwapNow);
+                            StaticVarSet(svP + "TargetPx", ibVwapNow);
+                            ibCurTarget = ibVwapNow;
+                            ibJustArmedTarget = True;
+                            IbLogEvt(svP, "VWAP LMT ARMED @" +
+                                NumToStr(ibVwapNow, 1.4) +
+                                " qty=" + NumToStr(ibAbsPos, 1.0));
+                            if (DebugTrace)
+                                _TRACE("IB VWAP LMT ARMED " + ibTicker +
+                                    " Side=" + ibTgtSide +
+                                    " Px=" + NumToStr(ibVwapNow, 1.4) +
+                                    " Qty=" + NumToStr(ibAbsPos, 1.0) +
+                                    " TargetOID=" + ibTargetOID);
+                        }
+                        else if (DebugTrace)
+                            _TRACE("IB VWAP LMT ARM FAILED " + ibTicker +
+                                " - PlaceOrder empty, will retry");
+                    }
+                    else if (ibTargetOID != "" AND NOT ibJustArmedTarget
+                        AND NOT ibJustFilled AND ibTgtSide != "")
+                    {
+                        // Chase RTH VWAP when it drifts by >= 1 cent
+                        if (abs(ibVwapNow - ibCurTarget) >= 0.01)
+                        {
+                            ibPrevTgtOID = ibTargetOID;
+                            ibModRet = ibc.ModifyOrder(ibTargetOID, ibTicker,
+                                ibTgtSide, ibAbsPos, "LMT", ibVwapNow, 0,
+                                "DAY", True, IBTickSize);
+                            if (ibModRet != "")
+                            {
+                                if (ibModRet != ibPrevTgtOID AND ibPrevTgtOID != "")
+                                {
+                                    ibc.CancelOrder(ibPrevTgtOID);
+                                    if (DebugTrace)
+                                        _TRACE("!!! IB VWAP LMT OID CHANGED " +
+                                            ibTicker +
+                                            " PrevOID=" + ibPrevTgtOID +
+                                            " NewOID=" + ibModRet +
+                                            " - cancelled prev phantom");
+                                }
+                                ibTargetOID = ibModRet;
+                                StaticVarSetText(svP + "TargetOID", ibTargetOID);
+                                StaticVarSetText(svP + "LastTargetOID", ibTargetOID);
+                                StaticVarSet(svP + "CurTarget", ibVwapNow);
+                                StaticVarSet(svP + "TargetPx", ibVwapNow);
+                                ibCurTarget = ibVwapNow;
+                                if (DebugTrace)
+                                    _TRACE("IB VWAP LMT CHASE " + ibTicker +
+                                        " NewPx=" + NumToStr(ibVwapNow, 1.4) +
+                                        " OID=" + ibTargetOID);
+                            }
+                            else if (DebugTrace)
+                                _TRACE("IB VWAP LMT MODIFY FAILED " + ibTicker +
+                                    " OID=" + ibTargetOID +
+                                    " WantPx=" + NumToStr(ibVwapNow, 1.4) +
+                                    " - keep prior, retry next refresh");
+                        }
+                    }
+                }
+            }
 
             // Detect stop filled at IB.
             // Only fully clear state when IB also confirms flat position;
             // otherwise set CloseSent to suppress entry/orphan logic and let
             // the next refresh observe ibPos == 0 before resetting.
+            // On fill, also cancel any resting VWAP LMT (sibling).
             if (ibStopOID != "")
             {
                 ibStpSt = ibc.GetStatus(ibStopOID, True);
                 if (ibStpSt == "Filled")
                 {
                     StaticVarSetText(svP + "LastStopOID", ibStopOID);
+
+                    // Cancel VWAP LMT sibling if still working
+                    ibLastTgtOIDStp = StaticVarGetText(svP + "LastTargetOID");
+                    if (ibTargetOID != "")
+                    {
+                        ibc.CancelOrder(ibTargetOID);
+                        if (DebugTrace)
+                            _TRACE("IB STOP FILLED - cancel LMT TP " +
+                                ibTicker + " TargetOID=" + ibTargetOID);
+                        ibTargetOID = "";
+                        StaticVarSetText(svP + "TargetOID", "");
+                        StaticVarSet(svP + "CurTarget", 0);
+                        StaticVarSet(svP + "FixedLmt", 0);
+                    }
+                    if (ibLastTgtOIDStp != "" AND ibLastTgtOIDStp != ibTargetOID)
+                        ibc.CancelOrder(ibLastTgtOIDStp);
+
                     if (ibPos == 0)
                     {
                         ibDir = 0;
@@ -2071,6 +2903,12 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 " [" + ibc.GetStatus(ibStopOID, True) + "]" +
                 "  @ " + NumToStr(Nz(StaticVarGet(svP + "CurStop")), 1.2) +
                 "  Phase: " + NumToStr(Nz(StaticVarGet(svP + "VwapPhase")), 1.0);
+        if (ibTargetOID != "")
+            ibInfo = ibInfo + "\nVWAP LMT OID: " + ibTargetOID +
+                " [" + ibc.GetStatus(ibTargetOID, True) + "]" +
+                "  @ " + NumToStr(Nz(StaticVarGet(svP + "CurTarget")), 1.2);
+        else if (ibUseVwapLmt AND ibDir != 0)
+            ibInfo = ibInfo + "\nVWAP LMT: waiting for touch (H/L vs RTH VWAP)";
 
         if (EntryMethodParam == 2 AND ibATR > 0)
         {

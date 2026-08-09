@@ -6,16 +6,24 @@
 //
 // REQUIRES:
 //   Display params: ShowRthVwapBands, ShowRthVwap2SD, VwapColor/Style/Width,
-//     SD1Color/Style/Width, SD2Color/Style/Width, ShowStopLine,
-//     StopLineColor, StopLineWidth, ShowEntryLine, EntryLineColor,
-//     EntryLineWidth
+//     SD1Color/Style/Width, SD2Color/Style/Width,
+//     ShowEntryLine, EntryLineColor, EntryLineWidth,
+//     ShowStopLine, StopLineColor, StopLineWidth,
+//     ShowTargetLine, TargetLineColor, TargetLineWidth,
+//     ShowCurrentPriceLine, CurrentPriceLineColor, CurrentPriceLineWidth
 //   Data: RthVwap, RthVwapU1SD, RthVwapL1SD, RthVwapU2SD, RthVwapL2SD
 //   Signals: Buy, Sell, Short, Cover
 //   Position arrays: PosDir, PosEntry, PosStop, PosTarget, PosQty
 //   Misc: EnableAutoTrade (param), StrategyCode (string), _svPfx, dn
 //
 // PROVIDES:
-//   IbLogEvt() helper (used by the IB engine), lb (= BarCount - 1)
+//   lb (= BarCount - 1)
+//   _axMin/_axMax/_px* /_axOk (for optional strategy GFX after this include)
+//
+// REQUIRES (include at formula TOP LEVEL before this file):
+//   AFL_Lib_IbLogEvt.afl  — IbLogEvt() used by AFL_Lib_IBEngine.afl
+//   Do NOT include IbLogEvt from inside if/else; AmiBroker rejects nested
+//   `function` definitions.
 // ============================================================================
 
 // ============================================================================
@@ -50,30 +58,53 @@ _pxLeft  = Status("pxchartleft");
 _pxRight = Status("pxchartright");
 _axOk    = (_axMax > _axMin);
 
+// Ensure overlay toggles exist. Param*() by the same name is shared with
+// strategy UI when already declared; this keeps Error 29 away when overlays
+// are included from a wrapper / updated before the host formula.
+ShowEntryLine = ParamToggle("Show Entry Line", "No|Yes", 1);
+EntryLineColor = ParamColor("Entry Line Color", ColorRGB(180, 180, 180));
+EntryLineWidth = Param("Entry Line Width", 2, 1, 5, 1);
+ShowStopLine = ParamToggle("Show Stop Line", "No|Yes", 1);
+StopLineColor = ParamColor("Stop Line Color", colorRed);
+StopLineWidth = Param("Stop Line Width", 2, 1, 5, 1);
+ShowTargetLine = ParamToggle("Show Take Profit Line", "No|Yes", 1);
+TargetLineColor = ParamColor("Take Profit Line Color", colorAqua);
+TargetLineWidth = Param("Take Profit Line Width", 2, 1, 5, 1);
+ShowCurrentPriceLine = ParamToggle("Show Current Price Line", "No|Yes", 1);
+CurrentPriceLineColor = ParamColor("Current Price Line Color", ColorRGB(205, 255, 6));
+CurrentPriceLineWidth = Param("Current Price Line Width", 2, 1, 5, 1);
+
 // Prefer IB live levels when auto-trading; fall back to backtest Pos* arrays.
-_curEntry = 0;
-_curStop  = 0;
+_curEntry  = 0;
+_curStop   = 0;
+_curTarget = 0;
 if (EnableAutoTrade)
 {
     _ibSvP = "IB_" + Name() + "_";
     _ibDir = Nz(StaticVarGet(_ibSvP + "Dir"));
     if (_ibDir != 0)
     {
-        _curEntry = Nz(StaticVarGet(_ibSvP + "FillPx"));
-        _curStop  = Nz(StaticVarGet(_ibSvP + "CurStop"));
+        _curEntry  = Nz(StaticVarGet(_ibSvP + "FillPx"));
+        _curStop   = Nz(StaticVarGet(_ibSvP + "CurStop"));
+        // Working LMT TP uses CurTarget; TargetPx is the overlay seed.
+        _curTarget = Nz(StaticVarGet(_ibSvP + "CurTarget"));
+        if (_curTarget <= 0)
+            _curTarget = Nz(StaticVarGet(_ibSvP + "TargetPx"));
     }
 }
 if (_curEntry == 0)
     _curEntry = Nz(PosEntry[BarCount - 1]);
 if (_curStop == 0)
     _curStop = Nz(PosStop[BarCount - 1]);
+if (_curTarget == 0)
+    _curTarget = Nz(PosTarget[BarCount - 1]);
 
 if (ShowEntryLine AND _curEntry > 0 AND _axOk)
 {
     _entryY = _pxBot - (_curEntry - _axMin) / (_axMax - _axMin) * (_pxBot - _pxTop);
 
     GfxSetOverlayMode(1);
-    // Pen style 2 = dashed (same as stop line).
+    // Pen style 2 = dashed (same as stop / target / price lines).
     GfxSelectPen(EntryLineColor, EntryLineWidth, 2);
     GfxMoveTo(_pxLeft, _entryY);
     GfxLineTo(_pxRight, _entryY);
@@ -99,6 +130,40 @@ if (ShowStopLine AND _curStop > 0 AND _axOk)
     GfxTextOut(NumToStr(_curStop, 1.2), _pxRight + 4, _stopY - 8);
 }
 
+if (ShowTargetLine AND _curTarget > 0 AND _axOk)
+{
+    _tgtY = _pxBot - (_curTarget - _axMin) / (_axMax - _axMin) * (_pxBot - _pxTop);
+
+    GfxSetOverlayMode(1);
+    GfxSelectPen(TargetLineColor, TargetLineWidth, 2);
+    GfxMoveTo(_pxLeft, _tgtY);
+    GfxLineTo(_pxRight, _tgtY);
+
+    GfxSelectFont("Tahoma", 8, 700);
+    GfxSetBkMode(1);
+    GfxSetTextColor(TargetLineColor);
+    GfxTextOut(NumToStr(_curTarget, 1.2), _pxRight + 4, _tgtY - 8);
+}
+
+if (ShowCurrentPriceLine AND _axOk)
+{
+    _curPx = C[BarCount - 1];
+    if (_curPx > 0)
+    {
+        _priceY = _pxBot - (_curPx - _axMin) / (_axMax - _axMin) * (_pxBot - _pxTop);
+
+        GfxSetOverlayMode(1);
+        GfxSelectPen(CurrentPriceLineColor, CurrentPriceLineWidth, 2);
+        GfxMoveTo(_pxLeft, _priceY);
+        GfxLineTo(_pxRight, _priceY);
+
+        GfxSelectFont("Tahoma", 8, 700);
+        GfxSetBkMode(1);
+        GfxSetTextColor(CurrentPriceLineColor);
+        GfxTextOut(NumToStr(_curPx, 1.2), _pxRight + 4, _priceY - 8);
+    }
+}
+
 // ============================================================================
 // DISPLAY — Position Info Overlay (GFX)
 // ----------------------------------------------------------------------------
@@ -112,20 +177,6 @@ if (ShowStopLine AND _curStop > 0 AND _axOk)
 // still works.
 // ============================================================================
 lb = BarCount - 1;
-
-// ---------------------------------------------------------------------------
-// On-chart event log helper.
-// The AmiBroker trace window scrolls far too fast to follow live, so the key
-// auto-trade events (orders placed / cancelled / filled / errors) are mirrored
-// into a small per-symbol rolling buffer that is rendered on the chart Title.
-// Newest entry first; the buffer is length-capped so old lines fall off.
-// ---------------------------------------------------------------------------
-function IbLogEvt(evtPfx, evtMsg)
-{
-    evtKey  = evtPfx + "EvtLog";
-    evtPrev = StaticVarGetText(evtKey);
-    StaticVarSetText(evtKey, StrLeft(evtMsg + "\n" + evtPrev, 500));
-}
 
 _useIB = False;
 if (EnableAutoTrade)
