@@ -1,0 +1,44 @@
+// ============================================================================
+// BP COLUMNS — custom trade-list formulas (BP_ prefix)
+// ----------------------------------------------------------------------------
+// Included from shared_variables.afl, after mabekit.afl. Same role as
+// mabekit.afl, for formulas that are not Trade-Ideas MK_ columns.
+//
+// Uses the session variables at the top of shared_variables.afl:
+//   TodayOpen, YesterdayDailyHigh, YesterdayDailyLow, MinutesSinceOpen
+// YesterdayDailyHigh / YesterdayDailyLow are the prior completed RTH
+// high and low (newday starts at 9:30; the last-RTH-bar snapshot is
+// the prior session, including on the 16:00 bar and after hours).
+//
+// Add new BP_ arrays in this file, then add the same array to
+// BpColumnPayload and CbtBpFieldNames below, in that order.
+// AFL_Lib_MkColumns.afl appends this payload after the MK_ fields, so
+// every strategy that already exports MK_ columns also exports BP_.
+// ============================================================================
+
+// 1 = today's RTH open is inside the previous RTH high-low (inclusive).
+// 0 = open is outside that range (above the prior high or below the prior low).
+// Null before 9:30, or when the prior range is not valid yet.
+// Same boundary as GAG_Strategy.afl RequireHodLodGap:
+//   outside up   = TodayOpen > prior RTH high
+//   outside down = TodayOpen < prior RTH low
+_bpOpenKnown = MinutesSinceOpen >= 0 AND TodayOpen > 0;
+_bpRangeOk   = YesterdayDailyLow > 0 AND YesterdayDailyHigh >= YesterdayDailyLow;
+
+BP_OpenInRth = IIf(NOT _bpOpenKnown OR NOT _bpRangeOk, Null,
+    IIf(TodayOpen >= YesterdayDailyLow AND TodayOpen <= YesterdayDailyHigh, 1, 0));
+
+function BpColumnNum(v, fmt)
+{
+    return StrReplace(NumToStr(v, fmt, False), ",", ".");
+}
+
+function BpColumnPayload(bar)
+{
+    local s;
+    s = BpColumnNum(BP_OpenInRth[bar], 1.0);
+    return s;
+}
+
+// Same order as BpColumnPayload. AFL_Lib_MkColumns appends this list.
+CbtBpFieldNames = "BP_OpenInRth";

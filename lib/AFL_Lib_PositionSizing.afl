@@ -1,24 +1,59 @@
 // ============================================================================
-// LIB: POSITION SIZING - percent-risk / fixed-share with equity caps
+// LIB: POSITION SIZING - percent-risk / fixed-share / fixed dollar value
 // ----------------------------------------------------------------------------
 // Extracted verbatim from ORB_Strategy.afl entry blocks (Phase 2 extraction).
 // Pure functions; call them from the strategy's entry logic.
 //
-// REQUIRES (params defined BEFORE #include):
+// REQUIRES (defined BEFORE #include):
 //   UsePercentRisk, RiskPercent, MaxShares, FixedShares,
 //   OverrideBalance, MaxPctOfEquity
+//   _FixedPosDefault   0 or 1 — default for "Use Fixed Position Value".
+//                      0 keeps existing % risk / fixed-share backtests.
+//                      1 is the VWAP constant-dollar default.
 //
-// PROVIDES:
-//   SizingRiskQty(stopDist)         shares allowed by % risk of balance
+// PROVIDES (params land in the host's Position Sizing section):
+//   UseFixedRiskDollar, RiskDollars
+//   UseFixedPositionValue, FixedPositionValue
+//   SizingRiskBudget()              dollar risk used for share count
+//   SizingRiskQty(stopDist)         shares allowed by that dollar risk
 //   SizingFinalQty(riskQty, entryP) final qty after MaxShares + equity caps
-//                                   (riskQty ignored when UsePercentRisk off)
+//                                   (riskQty ignored when risk sizing is off)
+//   SizingFixedQty(entryP)          shares for a constant dollar notional
+//   SizingEntryQty(stopDist, entryP) chart / loop qty
+//   SizingApplyBacktest(stopDist)   SetPositionSize for the backtester
+//
+// Priority when more than one mode is on:
+//   Fixed Risk $  >  Fixed Position Value  >  % risk / fixed shares
 // ============================================================================
+
+// Same dollar loss at the stop on every trade. Off by default so % risk
+// keeps current backtest results. Does not compound. $300 matches 1% of
+// the $30,000 GAG override balance.
+UseFixedRiskDollar = ParamToggle("Use Fixed Risk $", "No|Yes", 0);
+RiskDollars        = Param("Risk $ per Trade", 300, 1, 1000000, 10);
+
+// Constant dollar notional per trade. Off by default so % risk and fixed
+// shares keep their current backtest results. Does not compound.
+UseFixedPositionValue = ParamToggle("Use Fixed Position Value", "No|Yes", _FixedPosDefault);
+FixedPositionValue    = Param("Fixed Position Value ($)", 25000, 1000, 10000000, 1000);
+
+// Dollar amount lost if the stop is hit. Fixed Risk $ when that toggle is
+// on (no account balance involved). Otherwise Risk % of the override balance.
+// Override 0 has no frozen balance: percent-of-equity sizing is applied in
+// SizingApplyBacktest against the real backtest equity. The $100,000 figure
+// remains only for callers that still ask this function for a percent-risk
+// share count with no override (chart / legacy loops).
+function SizingRiskBudget()
+{
+    global UseFixedRiskDollar, RiskDollars, OverrideBalance, RiskPercent;
+    acctBal = IIf(OverrideBalance > 0, OverrideBalance, 100000);
+    pctRisk = acctBal * (RiskPercent / 100);
+    return IIf(UseFixedRiskDollar, RiskDollars, pctRisk);
+}
 
 function SizingRiskQty(stopDist)
 {
-    global OverrideBalance, RiskPercent;
-    acctBal = IIf(OverrideBalance > 0, OverrideBalance, 100000);
-    maxRisk = acctBal * (RiskPercent / 100);
+    maxRisk = SizingRiskBudget();
     riskPerShare = stopDist;
     return floor(maxRisk / riskPerShare);
 }
@@ -27,10 +62,75 @@ function SizingFinalQty(riskQty, entryP)
 {
     // Array-safe: entryP/riskQty are often arrays (e.g. Close / stopDist).
     // AFL if/while cannot take array conditions - use IIf throughout.
-    global UsePercentRisk, MaxShares, MaxPctOfEquity, OverrideBalance, FixedShares;
+    global UsePercentRisk, UseFixedRiskDollar, MaxShares, MaxPctOfEquity, OverrideBalance, FixedShares;
     acctBal = IIf(OverrideBalance > 0, OverrideBalance, 100000);
     maxQtyByEquity = floor((acctBal * MaxPctOfEquity / 100) / entryP);
-    qRisk  = Min(Max(1, Min(riskQty, MaxShares)), Max(1, maxQtyByEquity));
+    qByCaps = Min(Max(1, Min(riskQty, MaxShares)), Max(1, maxQtyByEquity));
+    // Fixed $ risk and Override 0: riskQty is already floor(Risk $ / stop).
+    // Do not cap it with the $100,000 stand-in. The backtester's own equity
+    // is the funding limit. Max Shares still applies.
+    qByShares = Max(1, Min(riskQty, MaxShares));
+    noFrozenAcct = UseFixedRiskDollar AND NOT (OverrideBalance > 0);
+    qRisk  = IIf(noFrozenAcct, qByShares, qByCaps);
     qFixed = IIf(maxQtyByEquity >= 1, Min(FixedShares, maxQtyByEquity), FixedShares);
-    return IIf(UsePercentRisk, qRisk, qFixed);
+    useRisk = UseFixedRiskDollar OR UsePercentRisk;
+    return IIf(useRisk, qRisk, qFixed);
+}
+
+// Shares that put about FixedPositionValue dollars to work at entryP.
+// Array-safe. MaxShares is not applied: the backtest uses the dollar
+// amount itself (SetPositionSize / PositionSize), matching VWAP.
+function SizingFixedQty(entryP)
+{
+    global FixedPositionValue;
+    px = IIf(entryP > 0, entryP, 1);
+    return Max(1, floor(FixedPositionValue / px));
+}
+
+// Loop / chart quantity. Fixed Risk $ wins, then fixed notional, then % risk.
+function SizingEntryQty(stopDist, entryP)
+{
+    global UseFixedPositionValue, UseFixedRiskDollar;
+    // AFL rejects return inside if (Error 30). Pick with IIf instead.
+    fixedQty = SizingFixedQty(entryP);
+    riskQty  = Max(1, SizingFinalQty(SizingRiskQty(stopDist), entryP));
+    useFixed = UseFixedPositionValue AND NOT UseFixedRiskDollar;
+    return IIf(useFixed, fixedQty, riskQty);
+}
+
+// Backtester size. Fixed Risk $ is a constant loss at the stop (no compounding).
+// Then fixed notional. Otherwise: frozen sleeve off OverrideBalance, else
+// % of running equity, else fixed shares.
+function SizingApplyBacktest(stopDist)
+{
+    global UseFixedPositionValue, FixedPositionValue, UseFixedRiskDollar;
+    global OverrideBalance, UsePercentRisk, RiskPercent, MaxPctOfEquity, FixedShares;
+
+    if (UseFixedRiskDollar)
+    {
+        _riskQty = SizingRiskQty(stopDist);
+        _qty = SizingFinalQty(_riskQty, C);
+        // No frozen account: lock the share count. Dollars-at-Close would
+        // resize the trade again at the fill. A frozen override keeps the
+        // prior dollar size so existing override-balance tests stay put.
+        if (OverrideBalance > 0)
+            SetPositionSize(_qty * C, spsValue);
+        else
+            SetPositionSize(_qty, spsShares);
+    }
+    else if (UseFixedPositionValue)
+        SetPositionSize(FixedPositionValue, spsValue);
+    else if (OverrideBalance > 0)
+    {
+        _riskQty = SizingRiskQty(stopDist);
+        _qty = SizingFinalQty(_riskQty, C);
+        SetPositionSize(_qty * C, spsValue);
+    }
+    else if (UsePercentRisk)
+    {
+        _posPct = IIf(C > 0 AND stopDist > 0, RiskPercent * C / stopDist, 0);
+        SetPositionSize(Min(_posPct, MaxPctOfEquity), spsPercentOfEquity);
+    }
+    else
+        SetPositionSize(FixedShares, spsShares);
 }

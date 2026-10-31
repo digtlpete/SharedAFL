@@ -1,11 +1,20 @@
 // ============================================================================
 // LIB: IB EVENT LOG HELPER
 // ----------------------------------------------------------------------------
-// Must be #include'd at FORMULA TOP LEVEL (never inside if/else/for).
-// AmiBroker rejects `function` definitions inside compound statements.
+// Must be #include_once'd at the OUTERMOST formula top level (never inside
+// if/else/for, and never only from inside another lib). AmiBroker rejects
+// `function` definitions inside compound statements and often ignores
+// functions that arrive only through a nested #include.
 //
 // PROVIDES:
 //   IbLogEvt(evtPfx, evtMsg) — append a line to the per-symbol IB event log
+//   IbClampStopPx(dir, fillPx, stopPx, stopDist) — never widen a stop
+//   IbStatusWorking(st) — IB still reports the order as working
+//
+// IbClampStopPx / IbStatusWorking used to live in AFL_Lib_IBEngine.afl.
+// SZDZ (and any host) includes IBEngine from inside `if (_isChart)` —
+// AmiBroker then Error-30s on `function` / `return` and the rest of the
+// host formula fails to parse (undefined identifiers, extra braces).
 // ============================================================================
 
 function IbLogEvt(evtPfx, evtMsg)
@@ -13,4 +22,43 @@ function IbLogEvt(evtPfx, evtMsg)
     evtKey  = evtPfx + "EvtLog";
     evtPrev = StaticVarGetText(evtKey);
     StaticVarSetText(evtKey, StrLeft(evtMsg + "\n" + evtPrev, 500));
+}
+
+// Never re-arm a protective stop wider than the strategy's published
+// distance (StopDistOverride / MaxStopLossPts / ATR). Keeps a tighter
+// trail. AFL Error 30: no `return` inside if/else — keep this at file top.
+function IbClampStopPx(dir, fillPx, stopPx, stopDist)
+{
+    _clOut = stopPx;
+    _clCap = 0;
+    if (stopDist > 0 AND fillPx > 0)
+    {
+        if (dir == 1)
+            _clCap = fillPx - stopDist;
+        else if (dir == -1)
+            _clCap = fillPx + stopDist;
+    }
+    if (_clOut <= 0)
+        _clOut = _clCap;
+    else if (_clCap > 0)
+    {
+        if (dir == 1 AND _clOut < _clCap)
+            _clOut = _clCap;
+        else if (dir == -1 AND _clOut > _clCap)
+            _clOut = _clCap;
+    }
+    return _clOut;
+}
+
+// True when IB still reports the order as working (not filled/cancelled).
+// STP orders sit in PreSubmitted until the trigger price is hit.
+function IbStatusWorking(st)
+{
+    return st == "PreSubmitted"
+        OR st == "Submitted"
+        OR st == "Pending"
+        OR st == "NotYetTransmitted"
+        OR st == "ApiPending"
+        OR st == "PendingSubmit"
+        OR st == "PendingCancel";
 }

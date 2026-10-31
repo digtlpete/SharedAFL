@@ -1,0 +1,59 @@
+// ============================================================================
+// LIB: CUSTOM BACKTEST — per-trade metric columns (portfolio report)
+// ----------------------------------------------------------------------------
+// Generic pipe-payload CBT. Strategy writes one static-var string per exit:
+//   StaticVarSetText(StrategyCode + "Ex" + Name() + DateTimeToStr(dt[i]), payload);
+// Payload fields are '|' separated and match CbtFieldNames order (comma list).
+// Field 0 / "Exit Reason" is text; all other fields are numeric (StrToNum).
+//
+// Format numbers with StrReplace(NumToStr(x, fmt), ",", ".") and ADV as
+// NumToStr(Round(adv), 1.0, False) so locale commas cannot break parsing.
+// Namespace keys with StrategyCode so two strategies can coexist.
+//
+// REQUIRES (defined by the including strategy BEFORE #include):
+//   StrategyCode    (string)  static-var namespace
+//   CbtFieldNames   (string)  comma-separated metric names, same order as payload
+//                             empty string = skip CBT (Explore / chart / score-only)
+//
+// Include this file at formula TOP LEVEL after Buy/Sell/Short/Cover are final.
+// Portfolio backtest only (Status actionPortfolio). Individual mode has no
+// custom columns.
+//
+// NOTE: if you see "Error 15. Endless loop detected in FOR loop" with the
+// caret inside this loop, raise Tools -> Preferences -> AFL ->
+// "Endless loop detection threshold" above the closed-trade count.
+// ============================================================================
+
+SetCustomBacktestProc("");
+
+if (CbtFieldNames != "" AND Status("action") == actionPortfolio)
+{
+    bo = GetBacktesterObject();
+
+    // Backtest(True) runs the engine but suppresses the automatic trade list
+    // so we can append custom columns first, then ListTrades().
+    bo.Backtest(True);
+
+    for (trade = bo.GetFirstTrade(); trade; trade = bo.GetNextTrade())
+    {
+        trade_metric = StaticVarGetText(
+            StrategyCode + "Ex" + trade.Symbol + DateTimeToStr(trade.ExitDateTime));
+
+        // Ceiling only. An empty name stops the scan, so shorter lists are unchanged.
+        // 512 covers a strategy's own fields plus the MK_ columns and the
+        // BP_ columns appended after them in AFL_Lib_MkColumns.afl.
+        for (fi = 0; fi < 512; fi++)
+        {
+            fname = StrExtract(CbtFieldNames, fi);
+            if (fname == "")
+                break;
+            fval = StrExtract(trade_metric, fi, '|');
+            if (fi == 0 OR fname == "Exit Reason")
+                trade.AddCustomMetric(fname, fval);
+            else
+                trade.AddCustomMetric(fname, StrToNum(fval));
+        }
+    }
+
+    bo.ListTrades();
+}

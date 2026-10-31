@@ -4,11 +4,14 @@
 // Extracted verbatim from ORB_Strategy.afl (Phase 1 library extraction).
 // Rendering only — nothing here can change backtest signals.
 //
-// REQUIRES:
+// REQUIRES (host must Param() these before include — do not re-declare here;
+//   a second Param() call duplicates the UI under the formula name):
 //   Display params: ShowRthVwapBands, ShowRthVwap2SD, VwapColor/Style/Width,
 //     SD1Color/Style/Width, SD2Color/Style/Width,
+//     ShowStopLine, StopLineColor, StopLineWidth
+//   Optional (typeof-guarded below — ORB and other stale hosts omit them;
+//     GAG Param()s them in Chart Display, so we must not re-declare there):
 //     ShowEntryLine, EntryLineColor, EntryLineWidth,
-//     ShowStopLine, StopLineColor, StopLineWidth,
 //     ShowTargetLine, TargetLineColor, TargetLineWidth,
 //     ShowCurrentPriceLine, CurrentPriceLineColor, CurrentPriceLineWidth
 //   Data: RthVwap, RthVwapU1SD, RthVwapL1SD, RthVwapU2SD, RthVwapL2SD
@@ -20,10 +23,8 @@
 //   lb (= BarCount - 1)
 //   _axMin/_axMax/_px* /_axOk (for optional strategy GFX after this include)
 //
-// REQUIRES (include at formula TOP LEVEL before this file):
-//   AFL_Lib_IbLogEvt.afl  — IbLogEvt() used by AFL_Lib_IBEngine.afl
-//   Do NOT include IbLogEvt from inside if/else; AmiBroker rejects nested
-//   `function` definitions.
+// IbLogEvt() comes from AFL_Lib_IbLogEvt.afl — include_once at the
+// outermost formula top, not from this file.
 // ============================================================================
 
 // ============================================================================
@@ -49,30 +50,28 @@ PlotShapes(IIf(Cover, shapeCircle, shapeNone), colorOrange, 0, L, -15);
 // ============================================================================
 // DISPLAY — Active Entry + Stop / Trailing Stop lines (GFX horizontal)
 // ============================================================================
-// Shared axis metrics for any level lines drawn this refresh.
-_axMin   = Status("axisminy");
-_axMax   = Status("axismaxy");
-_pxTop   = Status("pxcharttop");
-_pxBot   = Status("pxchartbottom");
-_pxLeft  = Status("pxchartleft");
-_pxRight = Status("pxchartright");
-_axOk    = (_axMax > _axMin);
-
-// Ensure overlay toggles exist. Param*() by the same name is shared with
-// strategy UI when already declared; this keeps Error 29 away when overlays
-// are included from a wrapper / updated before the host formula.
-ShowEntryLine = ParamToggle("Show Entry Line", "No|Yes", 1);
-EntryLineColor = ParamColor("Entry Line Color", ColorRGB(180, 180, 180));
-EntryLineWidth = Param("Entry Line Width", 2, 1, 5, 1);
-ShowStopLine = ParamToggle("Show Stop Line", "No|Yes", 1);
-StopLineColor = ParamColor("Stop Line Color", colorRed);
-StopLineWidth = Param("Stop Line Width", 2, 1, 5, 1);
-ShowTargetLine = ParamToggle("Show Take Profit Line", "No|Yes", 1);
-TargetLineColor = ParamColor("Take Profit Line Color", colorAqua);
-TargetLineWidth = Param("Take Profit Line Width", 2, 1, 5, 1);
-ShowCurrentPriceLine = ParamToggle("Show Current Price Line", "No|Yes", 1);
-CurrentPriceLineColor = ParamColor("Current Price Line Color", ColorRGB(205, 255, 6));
-CurrentPriceLineWidth = Param("Current Price Line Width", 2, 1, 5, 1);
+// Stop-line Param*() stay on the host (every extracted strategy already has
+// them). Entry / target / last-price: Param() only when the host never
+// declared the name. typeof() is AmiBroker's Error-29-safe check; a second
+// Param() on GAG would duplicate those toggles in the Parameters dialog.
+if (typeof(ShowEntryLine) == "undefined")
+    ShowEntryLine = ParamToggle("Show Entry Line", "No|Yes", 1);
+if (typeof(EntryLineColor) == "undefined")
+    EntryLineColor = ParamColor("Entry Line Color", ColorRGB(180, 180, 180));
+if (typeof(EntryLineWidth) == "undefined")
+    EntryLineWidth = Param("Entry Line Width", 2, 1, 5, 1);
+if (typeof(ShowTargetLine) == "undefined")
+    ShowTargetLine = ParamToggle("Show Take Profit Line", "No|Yes", 1);
+if (typeof(TargetLineColor) == "undefined")
+    TargetLineColor = ParamColor("Take Profit Line Color", colorAqua);
+if (typeof(TargetLineWidth) == "undefined")
+    TargetLineWidth = Param("Take Profit Line Width", 2, 1, 5, 1);
+if (typeof(ShowCurrentPriceLine) == "undefined")
+    ShowCurrentPriceLine = ParamToggle("Show Current Price Line", "No|Yes", 1);
+if (typeof(CurrentPriceLineColor) == "undefined")
+    CurrentPriceLineColor = ParamColor("Current Price Line Color", ColorRGB(205, 255, 6));
+if (typeof(CurrentPriceLineWidth) == "undefined")
+    CurrentPriceLineWidth = Param("Current Price Line Width", 2, 1, 5, 1);
 
 // Prefer IB live levels when auto-trading; fall back to backtest Pos* arrays.
 _curEntry  = 0;
@@ -98,6 +97,24 @@ if (_curStop == 0)
     _curStop = Nz(PosStop[BarCount - 1]);
 if (_curTarget == 0)
     _curTarget = Nz(PosTarget[BarCount - 1]);
+
+// GFX horizontals do not participate in Y-axis scaling. Hidden plots
+// keep entry / stop / target on-scale so a 2.5R line is not drawn
+// off the top of the pane. Read axis AFTER these Plots.
+if (ShowEntryLine AND _curEntry > 0)
+    Plot(_curEntry, "", colorDefault, styleNoDraw | styleNoLabel);
+if (ShowStopLine AND _curStop > 0)
+    Plot(_curStop, "", colorDefault, styleNoDraw | styleNoLabel);
+if (ShowTargetLine AND _curTarget > 0)
+    Plot(_curTarget, "", colorDefault, styleNoDraw | styleNoLabel);
+
+_axMin   = Status("axisminy");
+_axMax   = Status("axismaxy");
+_pxTop   = Status("pxcharttop");
+_pxBot   = Status("pxchartbottom");
+_pxLeft  = Status("pxchartleft");
+_pxRight = Status("pxchartright");
+_axOk    = (_axMax > _axMin);
 
 if (ShowEntryLine AND _curEntry > 0 AND _axOk)
 {

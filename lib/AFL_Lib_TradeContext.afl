@@ -1,0 +1,44 @@
+// ============================================================================
+// LIB: TRADE CONTEXT — gap / EMA-ATR / prior-day open-in-band (shared CBT)
+// ----------------------------------------------------------------------------
+// Same formulas as ORB_Strategy.afl (~904-943), minus OR-only metrics.
+// Snapshot these at entry and emit via AFL_Lib_CustomBacktest.afl.
+//
+// REQUIRES (defined by the including strategy BEFORE #include):
+//   DailyATR            (array)  chart ATR used for stops / IBEngine
+//   RthOpen             (from AFL_Lib_SessionTime.afl)
+//   PrevDayU1SD, PrevDayL1SD, PrevDayRthClose
+//                       (from AFL_Lib_VwapBands.afl)
+//   Ema10Daily, Ema21Daily
+//                       (from AFL_Lib_DailyContext.afl)
+//
+// PROVIDES (globals):
+//   TodayOpenRth        RTH open carried across the session
+//   GapOpenPct          signed % prior RTH close -> today's RTH open
+//   PrevDayOpenIn1SD    1 if RTH open inside prior-day VWAP +/-1SD
+//   GapPts, GapAtr, AbsGapPct, AbsGapAtr
+//   Ema10DistAtr, Ema21DistAtr
+// ============================================================================
+
+TodayOpenRth = ValueWhen(RthOpen, O);
+
+// 1 = today's RTH open lies inside prior day's RTH VWAP +/-1SD bands (inclusive).
+// 0 = open outside those bands, or bands not yet valid on that bar.
+PrevDayOpenIn1SD = IIf(PrevDayU1SD > 0 AND PrevDayL1SD > 0
+        AND TodayOpenRth >= PrevDayL1SD AND TodayOpenRth <= PrevDayU1SD,
+    1, 0);
+
+// Gap Open %: signed % from prior calendar day's last RTH close to today's
+// RTH open. Positive = gap up, negative = gap down.
+GapOpenPct = IIf(TodayOpenRth > 0 AND PrevDayRthClose > 0,
+    100 * (TodayOpenRth - PrevDayRthClose) / PrevDayRthClose, 0);
+
+GapPts       = IIf(PrevDayRthClose > 0 AND TodayOpenRth > 0,
+               TodayOpenRth - PrevDayRthClose, 0);
+GapAtr       = IIf(DailyATR > 0, GapPts / DailyATR, 0);
+AbsGapPct    = abs(GapOpenPct);
+AbsGapAtr    = abs(GapAtr);
+Ema10DistAtr = IIf(DailyATR > 0 AND Ema10Daily > 0,
+               (C - Ema10Daily) / DailyATR, 0);
+Ema21DistAtr = IIf(DailyATR > 0 AND Ema21Daily > 0,
+               (C - Ema21Daily) / DailyATR, 0);

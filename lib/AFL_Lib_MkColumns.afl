@@ -1,0 +1,255 @@
+// ============================================================================
+// LIB: MK BACKTEST COLUMNS — Trade-Ideas column library on the trade list
+// ----------------------------------------------------------------------------
+// One copy of the MK_ column list for every strategy that uses the pipe
+// custom-backtest library (AFL_Lib_CustomBacktest.afl).
+//
+// REQUIRES, before this include:
+//   shared_variables.afl (or mabekit.afl) so the MK_ arrays exist
+//   UseMkColumns = 1;   // set 0 to omit these columns from this strategy
+//
+// Each strategy still does three things:
+//   1. Include this file.
+//   2. On entry:  cbt_mk = MkColumnPayload(bar);
+//   3. On exit:   append "|" + cbt_mk to the pipe payload, and append
+//                 MkColumnNames() to CbtFieldNames.
+//
+// MkColumnPayload and CbtMkFieldNames are the same order. Strategy-specific
+// fields stay in front of this list. Do not insert MK_ columns between them.
+// BP_ columns from BP_Columns.afl are appended after the last MK_ field.
+// Portfolio backtest only. The custom-backtest loop stops at 512 fields.
+// ============================================================================
+
+if (IsEmpty(VarGet("UseMkColumns")))
+    UseMkColumns = 1;
+_MkColumnsOn = UseMkColumns;
+CbtMkFieldNames = "";
+
+function MkColumnNum(v, fmt)
+{
+    return StrReplace(NumToStr(v, fmt, False), ",", ".");
+}
+
+function MkColumnPayload(bar)
+{
+    local s;
+    s = "";
+    if (_MkColumnsOn)
+    {
+    s = MkColumnNum(MK_Price[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_GUD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_GUP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Time[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_PostD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PostP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_UpJan1D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_UpJan1P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_RC[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Up1[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol5D[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol3M[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_DV[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_TV[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_PV[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_YPV[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Vol1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Vol5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up5[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up10[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up15[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Vol30[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up30[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_PMVol[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_ATR[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_TRangeD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_TRangeP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range2P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up2[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Range5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range5P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range10P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range15P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWV[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWVP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RV[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Wiggle[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_GUR[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range30[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range30P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range60[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range60P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Up60[bar], 1.0);
+    s = s + "|" + MkColumnNum(MK_Range120[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range120P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range5D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range5DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range10D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range10DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range20D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Range20DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_POORP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp30[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp30[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp60[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp60[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DUp120[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PUp120[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Pivot[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PivotR1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PivotS1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PivotR2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_PivotS2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP3[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP4[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_VWAP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DVWAP2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DVWAP3[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DVWAP4[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DVWAP5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FCD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FCP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FCR[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FOD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FOP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FOR[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FOW[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FCDP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_FCPP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U5DD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U5DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U10DD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U10DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U20DD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_U20DP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_UYD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_UYP[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R5M[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R15M[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R30M[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R60M[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_BelowHigh[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_AboveLow[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_BelowHighPre[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_AboveLowPre[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RPD[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RPM[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R5D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R10D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R20D[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R3MO[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R6MO[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R9MO[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RY[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_R2Y[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RL[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RSI1[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RSI2[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RSI5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RSI15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_RSI60[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_DRSI[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Boll5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Boll15[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Boll60[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_Boll[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_SMA200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA8P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA8R[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA10P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA10R[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA20P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA20R[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA50P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA50R[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA200P[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_MA200R[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2SmaLa5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2SmaLa8[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2SmaLa10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2SmaLa20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2SmaLa200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5SmaLa5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5SmaLa8[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5SmaLa10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5SmaLa20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5SmaLa200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa5[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa8[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa130[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15SmaLa200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60SmaLa8[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60SmaLa10[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60SmaLa20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60SmaLa200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2Sma8a20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5Sma8a20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15Sma8a20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60Sma8a20[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_2Sma20a200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_5Sma20a200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_15Sma20a200[bar], 1.2);
+    s = s + "|" + MkColumnNum(MK_60Sma20a200[bar], 1.2);
+    s = s + "|" + BpColumnPayload(bar);
+    }
+    return s;
+}
+
+function MkColumnNames()
+{
+    local result;
+    result = "";
+    if (_MkColumnsOn AND StrLen(CbtMkFieldNames) > 0)
+        result = "," + CbtMkFieldNames;
+    return result;
+}
+
+if (_MkColumnsOn)
+{
+CbtMkFieldNames = "MK_Price,MK_GUD,MK_GUP,MK_Time,MK_PostD,MK_PostP,MK_UpJan1D,MK_UpJan1P"
+    + ",MK_Up,MK_RC,MK_Up1,MK_Vol5D,MK_Vol,MK_Vol3M,MK_DV,MK_TV"
+    + ",MK_PV,MK_YPV,MK_Vol1,MK_Vol5,MK_Up5,MK_Vol10,MK_Up10,MK_Vol15"
+    + ",MK_Up15,MK_Vol30,MK_Up30,MK_PMVol,MK_ATR,MK_TRangeD,MK_TRangeP,MK_Range2"
+    + ",MK_Range2P,MK_Up2,MK_Range5,MK_Range5P,MK_Range10,MK_Range10P,MK_Range15,MK_Range15P"
+    + ",MK_VWV,MK_VWVP,MK_RV,MK_Wiggle,MK_GUR,MK_Range30,MK_Range30P,MK_Range60"
+    + ",MK_Range60P,MK_Up60,MK_Range120,MK_Range120P,MK_Range5D,MK_Range5DP,MK_Range10D,MK_Range10DP"
+    + ",MK_Range20D,MK_Range20DP,MK_POORP,MK_DUp1,MK_PUp1,MK_DUp2,MK_PUp2,MK_DUp5"
+    + ",MK_PUp5,MK_DUp10,MK_PUp10,MK_DUp15,MK_PUp15,MK_DUp30,MK_PUp30,MK_DUp60"
+    + ",MK_PUp60,MK_DUp120,MK_PUp120,MK_Pivot,MK_PivotR1,MK_PivotS1,MK_PivotR2,MK_PivotS2"
+    + ",MK_VWAP1,MK_VWAP2,MK_VWAP3,MK_VWAP4,MK_VWAP5,MK_VWAP,MK_DVWAP2,MK_DVWAP3"
+    + ",MK_DVWAP4,MK_DVWAP5,MK_FCD,MK_FCP,MK_FCR,MK_FOD,MK_FOP,MK_FOR"
+    + ",MK_FOW,MK_FCDP,MK_FCPP,MK_U5DD,MK_U5DP,MK_U10DD,MK_U10DP,MK_U20DD"
+    + ",MK_U20DP,MK_UYD,MK_UYP,MK_R5M,MK_R15M,MK_R30M,MK_R60M,MK_BelowHigh"
+    + ",MK_AboveLow,MK_BelowHighPre,MK_AboveLowPre,MK_RD,MK_RPD,MK_RPM,MK_R5D,MK_R10D"
+    + ",MK_R20D,MK_R3MO,MK_R6MO,MK_R9MO,MK_RY,MK_R2Y,MK_RL,MK_RSI1"
+    + ",MK_RSI2,MK_RSI5,MK_RSI15,MK_RSI60,MK_DRSI,MK_Boll5,MK_Boll15,MK_Boll60"
+    + ",MK_Boll,MK_SMA200,MK_MA8P,MK_MA8R,MK_MA10P,MK_MA10R,MK_MA20P,MK_MA20R"
+    + ",MK_MA50P,MK_MA50R,MK_MA200P,MK_MA200R,MK_2SmaLa5,MK_2SmaLa8,MK_2SmaLa10,MK_2SmaLa20"
+    + ",MK_2SmaLa200,MK_5SmaLa5,MK_5SmaLa8,MK_5SmaLa10,MK_5SmaLa20,MK_5SmaLa200,MK_15SmaLa5,MK_15SmaLa8"
+    + ",MK_15SmaLa10,MK_15SmaLa20,MK_15SmaLa130,MK_15SmaLa200,MK_60SmaLa8,MK_60SmaLa10,MK_60SmaLa20,MK_60SmaLa200"
+    + ",MK_2Sma8a20,MK_5Sma8a20,MK_15Sma8a20,MK_60Sma8a20,MK_2Sma20a200,MK_5Sma20a200,MK_15Sma20a200,MK_60Sma20a200"
+    + "," + CbtBpFieldNames
+;
+}
