@@ -92,6 +92,17 @@ Pending child OIDs are stored in `BrkStopOID{Long,Short}` /
 `BrkTgtOID{Long,Short}` until fill promotes them to `StopOID` / `TargetOID`.
 Fill protection therefore lives at the broker even if the chart is closed.
 
+## Several books, one ticker
+
+Order ids stay `IB_<symbol>_`. The book that places the entry stores
+`IB_<symbol>_Owner` = `StrategyCode` (persisted). Any other pane on that
+ticker skips entry, adopt, orphan recovery, stop changes, and the timed
+flatten. The position cap registry is `IB_<StrategyCode>_PortReg`, and a
+name counts only when its owner is that code.
+
+An auto-trade chart writes `state/panes/<StrategyCode>/<symbol>.txt` once
+per day so that book's morning sweep can close its own restored panes.
+
 **Blackout:** cancel the unfilled parent LMT **and** its `Brk*` children.
 Do not cancel `StopOID` / `TargetOID` for a position taken before the window.
 A fill-race guard leaves parent+children intact when the parent status is

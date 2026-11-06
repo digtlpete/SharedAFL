@@ -38,6 +38,11 @@
 //                       Optional StaticVar text LmtBlockLong/Short: when
 //                       LmtArmed is 0, IB Title uses that string instead
 //                       of a bare NoZoneArm (e.g. Gap / VwapGate / NoArmed).
+//                     : StaticVar text MktBlockLong/Short (method 0). When
+//                       the MKT signal is absent and the text is non-empty,
+//                       the Title gate uses it instead of NoBreakUp /
+//                       NoCloseAbove / AflHoldNoAdopt. Empty keeps the old
+//                       token so other books are unchanged.
 //                       Method 3 places a native IB bracket when
 //                       StopDistOverride/ATR stop dist > 0: parent LMT +
 //                       child STP (+ child LMT TP when TargetDistOverride
@@ -101,6 +106,35 @@ ibInfo = "";
 if (EnableAutoTrade AND Status("action") == actionIndicator)
 {
     RequestTimedRefresh(1, False);
+    // One file per open auto-trade pane so a morning sweep can close this
+    // book's restored charts without closing another book's documents.
+    // Rewritten once per symbol per day. Folder is StrategyCode, so GAG
+    // and GAGL never share a roster.
+    _rosterSym = Name();
+    _rosterSym = StrReplace(_rosterSym, "\\", "-");
+    _rosterSym = StrReplace(_rosterSym, "/", "-");
+    _rosterSym = StrReplace(_rosterSym, ":", "-");
+    _rosterSym = StrReplace(_rosterSym, "*", "-");
+    _rosterSym = StrReplace(_rosterSym, "?", "-");
+    _rosterSym = StrReplace(_rosterSym, Chr(34), "-");
+    _rosterSym = StrReplace(_rosterSym, "<", "-");
+    _rosterSym = StrReplace(_rosterSym, ">", "-");
+    _rosterSym = StrReplace(_rosterSym, "|", "-");
+    _rosterDir = "g:/OneDrive/01_TRADING/AFL_DEV/SharedAFL/state/panes/" + StrategyCode;
+    _rosterKey = "IB_" + StrategyCode + "_RosterDN_" + _rosterSym;
+    if (Nz(StaticVarGet(_rosterKey)) != dn[BarCount - 1])
+    {
+        fmkdir("g:/OneDrive/01_TRADING/AFL_DEV/SharedAFL/state");
+        fmkdir("g:/OneDrive/01_TRADING/AFL_DEV/SharedAFL/state/panes");
+        fmkdir(_rosterDir);
+        _rosterH = fopen(_rosterDir + "/" + _rosterSym + ".txt", "w");
+        if (_rosterH)
+        {
+            fputs(StrategyCode + "\n", _rosterH);
+            fclose(_rosterH);
+        }
+        StaticVarSet(_rosterKey, dn[BarCount - 1]);
+    }
     ibc = GetTradingInterface("IB");
 
     // ---- BUILD STAMP ----
@@ -113,7 +147,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
     // in DebugView for a given symbol, that chart is running a STALE cached
     // copy (e.g. one that still has the old CancelAllPendingOrders sweep) and
     // must be reloaded. Bump the date suffix whenever you change this file.
-    ORB_BUILD = "ORB build 2026-09-10 (fixed R TP dist)";
+    ORB_BUILD = "ORB build 2026-11-02 (MKT gate reasons)";
     _ibBuildKey = "IB_" + Name() + "_BuildStampDN";
     if (DebugTrace AND Nz(StaticVarGet(_ibBuildKey)) != dn[BarCount - 1])
     {
@@ -186,11 +220,43 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         ibLongFillCnt  = Nz(StaticVarGet(svP + "LongFillCnt"));
         ibShortFillCnt = Nz(StaticVarGet(svP + "ShortFillCnt"));
 
+        // One broker position per ticker. The first book to arm the name
+        // stores its StrategyCode here (persisted, so a restart still knows
+        // who trails and who flattens). A chart whose code does not match
+        // does not enter, adopt, replace the stop, or flatten.
+        // A tracked position with no owner yet (charts opened before this
+        // build) is claimed by whichever pane refreshes first.
+        ibOwner = StaticVarGetText(svP + "Owner");
+        if (ibOwner == "" AND ibDir != 0)
+        {
+            StaticVarSetText(svP + "Owner", StrategyCode, True);
+            ibOwner = StrategyCode;
+        }
+        ibForeign = (ibOwner != "" AND ibOwner != StrategyCode)
+            OR (ibOwner == "" AND ibPos != 0 AND ibDir == 0);
+        if (ibForeign)
+        {
+            ibGateLong = "OWNED BY " + WriteIf(ibOwner == "", "(none)", ibOwner);
+            ibGateShort = ibGateLong;
+            if (DebugTrace AND Nz(StaticVarGet(svP + "ForeignLogged")) != dn[lb])
+            {
+                _TRACE("IB OWNER SKIP " + ibTicker +
+                    " code=" + StrategyCode +
+                    " owner=" + WriteIf(ibOwner == "", "(none)", ibOwner) +
+                    " pos=" + NumToStr(ibPos, 1.0));
+                StaticVarSet(svP + "ForeignLogged", dn[lb]);
+            }
+        }
+
         // Entry-gate diagnostic strings. Defaulted here because the FLAT
         // entry block that computes them only runs when flat-and-not-closing;
         // the Title rendering below must always have a value to show.
-        ibGateLong  = "n/a (not flat)";
-        ibGateShort = "n/a (not flat)";
+        // A foreign book keeps the OWNED BY line set just above.
+        if (NOT ibForeign)
+        {
+            ibGateLong  = "n/a (not flat)";
+            ibGateShort = "n/a (not flat)";
+        }
 
         // ---- RECOVERY (manage-only) MODE ----
         // Read the crash-recovery flag file (written by recovery_orb.js).  It
@@ -397,7 +463,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // (common for futures, continuous contracts, forex, options). When
         // the filter mis-matches the calls fall back to acting on the whole
         // account, which silently kills working stops on other symbols.
-        if (TriggerPanic)
+        if (TriggerPanic AND NOT ibForeign)
         {
             ibLastStopOIDPanic = StaticVarGetText(svP + "LastStopOID");
             ibLastTgtOIDPanic  = StaticVarGetText(svP + "LastTargetOID");
@@ -471,7 +537,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                     " CloseOID=" + ibPanicCloseOID);
         }
 
-        if (TriggerCancelEntry)
+        if (TriggerCancelEntry AND NOT ibForeign)
         {
             if (ibLongOID != "")  { ibc.CancelOrder(ibLongOID);  ibLongOID = ""; }
             if (ibShortOID != "") { ibc.CancelOrder(ibShortOID); ibShortOID = ""; }
@@ -515,7 +581,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // a mismatch causes the call to cancel orders on OTHER symbols,
         // including their working protective stops. Explicit per-OID
         // cancellation is mathematically isolated to this chart.
-        if (TriggerResetTrack)
+        if (TriggerResetTrack AND NOT ibForeign)
         {
             // Preserve economic levels before wipe when a broker position is
             // still open — used as fallback if IB Avg. cost is unavailable.
@@ -876,7 +942,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // stop order has reached a terminal state. Treat ANY uncertain/empty/
         // intermediate status as "still working" to prevent accidentally
         // wiping state due to transient API hiccups.
-        if (ibPos == 0 AND ibDir != 0)
+        if (ibPos == 0 AND ibDir != 0 AND NOT ibForeign)
         {
             ibSyncOK = False;
             ibStpChk = "";
@@ -992,7 +1058,8 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         ibOrphan = False;
         ibCloseSentChk = Nz(StaticVarGet(svP + "CloseSent"));
 
-        if (ibPos != 0 AND (ibDir == 0 OR ibStopOID == "") AND NOT ibCloseSentChk)
+        if (ibPos != 0 AND (ibDir == 0 OR ibStopOID == "") AND NOT ibCloseSentChk
+            AND NOT ibForeign)
         {
             // Examine the last tracked stop to decide HOW to recover:
             //   - JUST FILLED  -> do nothing, the fill is in flight and
@@ -1216,7 +1283,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
                 _TRACE("IB CLOSESENT CLEARED " + ibTicker);
         }
 
-        if (ibPastExit)
+        if (ibPastExit AND NOT ibForeign)
         {
             // Cancel only the order IDs we placed for ibTicker. We
             // deliberately do NOT call ibc.CancelAllPendingOrders(ibTicker)
@@ -1353,7 +1420,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // Skipped when PastExit already ran (that path owns full flatten).
         // If the entry already Filled this refresh, leave parent + children
         // intact so FILL DETECTION can promote them to live stop/TP.
-        if (ibInBlackout AND NOT ibPastExit)
+        if (ibInBlackout AND NOT ibPastExit AND NOT ibForeign)
         {
             if (ibLongOID != "")
             {
@@ -1460,17 +1527,14 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         }
 
         // ================================================================
-        // PORTFOLIO POSITION CAP (shared across all chart instances)
+        // PORTFOLIO POSITION CAP (per StrategyCode, shared by that book's charts)
         // ----------------------------------------------------------------
-        // Each chart maintains a comma-separated registry of symbols seen
-        // today in StaticVarText("ORB_GLOBAL_PortfolioReg").  The live
-        // count of OPEN ORB positions is computed by walking that
-        // registry and summing IB_<sym>_Dir != 0.  Pending entries are
-        // intentionally NOT counted -- if every chart pre-armed a STPLMT
-        // we'd hit the cap before any actually filled, blocking the cap
-        // from doing its job.  Cap is enforced by gating ibCanLong /
-        // ibCanShort below; the existing "NOT ibCanX" branch then auto-
-        // cancels any working entry on this chart.
+        // Each book keeps its own comma-separated registry,
+        // StaticVarText("IB_<StrategyCode>_PortReg"). The open count walks
+        // that list and sums names whose IB_<sym>_Dir != 0 AND whose
+        // IB_<sym>_Owner is this StrategyCode. Another book's position
+        // does not consume this cap. Pending entries are intentionally
+        // NOT counted.
         //
         // Race window: between two charts' refreshes, both can see
         // count == cap-1, both place entries, both fill -> overshoot of
@@ -1478,8 +1542,8 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // (chart count), which is bounded by the launcher Top-N and
         // remains << account margin.
         // ================================================================
-        _ppDayKey = "ORB_GLOBAL_PortfolioRegDay";
-        _ppRegKey = "ORB_GLOBAL_PortfolioReg";
+        _ppDayKey = "IB_" + StrategyCode + "_PortRegDay";
+        _ppRegKey = "IB_" + StrategyCode + "_PortReg";
         _ppPrevDay = Nz(StaticVarGet(_ppDayKey));
         if (_ppPrevDay != ibDN)
         {
@@ -1487,7 +1551,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             StaticVarSet(_ppDayKey, ibDN);
         }
         _ppReg = StaticVarGetText(_ppRegKey);
-        if (StrFind("," + _ppReg, "," + ibTicker + ",") == 0)
+        if (NOT ibForeign AND StrFind("," + _ppReg, "," + ibTicker + ",") == 0)
         {
             _ppReg = _ppReg + ibTicker + ",";
             StaticVarSetText(_ppRegKey, _ppReg);
@@ -1496,7 +1560,8 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         ibPortfolioOpen = 0;
         for (_ppi = 0; (_ppSym = StrExtract(_ppReg, _ppi, ',')) != ""; _ppi++)
         {
-            if (Nz(StaticVarGet("IB_" + _ppSym + "_Dir")) != 0)
+            if (Nz(StaticVarGet("IB_" + _ppSym + "_Dir")) != 0
+                AND StaticVarGetText("IB_" + _ppSym + "_Owner") == StrategyCode)
                 ibPortfolioOpen = ibPortfolioOpen + 1;
         }
         ibPortfolioOK = NOT EnableMaxPortfolioPositions
@@ -1523,7 +1588,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // fill is processed. This is defence-in-depth on top of the
         // status-check guard in the cancel branch.
         // ================================================================
-        if (ibDir == 0 AND ibLongOID != "")
+        if (ibDir == 0 AND ibLongOID != "" AND NOT ibForeign)
         {
             ibLS = ibc.GetStatus(ibLongOID, True);
             if (ibLS == "Filled")
@@ -1667,7 +1732,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             }
         }
 
-        if (ibDir == 0 AND ibShortOID != "")
+        if (ibDir == 0 AND ibShortOID != "" AND NOT ibForeign)
         {
             ibSS = ibc.GetStatus(ibShortOID, True);
             if (ibSS == "Filled")
@@ -1815,7 +1880,7 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
         // and protected by ORPHAN RECOVERY above.
         // ================================================================
         if (ibPos == 0 AND ibDir == 0 AND NOT ibPastExit AND NOT ibCloseSent
-            AND NOT RecoveryManageOnly)
+            AND NOT RecoveryManageOnly AND NOT ibForeign)
         {
             if (DebugVerbose)
                 _TRACE("IB ENTRY BLOCK REACHED " + ibTicker +
@@ -2035,9 +2100,16 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT ibCountLongOK)                             _gL = _gL + " MaxBreak";
             if (NOT ibORWidthAtrOK)                            _gL = _gL + " ORWidth";
             if (NOT ibPortfolioOK)                             _gL = _gL + " PortCap";
-            if (EntryMethodParam == 0 AND NOT ibMktSigLong)    _gL = _gL +
-                WriteIf(MktConfirmClose, " NoCloseAbove",
-                  WriteIf(in_trade AND PosDir[lb] == 1, " AflHoldNoAdopt", " NoBreakUp"));
+            if (EntryMethodParam == 0 AND NOT ibMktSigLong)
+            {
+                _mktBlkL = StaticVarGetText(svP + "MktBlockLong");
+                if (_mktBlkL != "")
+                    _gL = _gL + " " + _mktBlkL;
+                else
+                    _gL = _gL +
+                        WriteIf(MktConfirmClose, " NoCloseAbove",
+                          WriteIf(in_trade AND PosDir[lb] == 1, " AflHoldNoAdopt", " NoBreakUp"));
+            }
             if (EntryMethodParam == 0 AND NOT ibBoVolLong)     _gL = _gL + " BreakVol";
             if (EntryMethodParam == 3 AND NOT ibLmtArmedLong)
             {
@@ -2071,9 +2143,16 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             if (NOT ibCountShortOK)                             _gS = _gS + " MaxBreak";
             if (NOT ibORWidthAtrOK)                             _gS = _gS + " ORWidth";
             if (NOT ibPortfolioOK)                              _gS = _gS + " PortCap";
-            if (EntryMethodParam == 0 AND NOT ibMktSigShort)    _gS = _gS +
-                WriteIf(MktConfirmClose, " NoCloseBelow",
-                  WriteIf(in_trade AND PosDir[lb] == -1, " AflHoldNoAdopt", " NoBreakDn"));
+            if (EntryMethodParam == 0 AND NOT ibMktSigShort)
+            {
+                _mktBlkS = StaticVarGetText(svP + "MktBlockShort");
+                if (_mktBlkS != "")
+                    _gS = _gS + " " + _mktBlkS;
+                else
+                    _gS = _gS +
+                        WriteIf(MktConfirmClose, " NoCloseBelow",
+                          WriteIf(in_trade AND PosDir[lb] == -1, " AflHoldNoAdopt", " NoBreakDn"));
+            }
             if (EntryMethodParam == 0 AND NOT ibBoVolShort)     _gS = _gS + " BreakVol";
             if (EntryMethodParam == 3 AND NOT ibLmtArmedShort)
             {
@@ -2401,6 +2480,8 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
 
             if (ibPlaceLong)
             {
+                StaticVarSetText(svP + "Owner", StrategyCode, True);
+                ibOwner = StrategyCode;
                 ibOffset = ibATR * StpLmtAtrFactor;
 
                 if (EntryMethodParam == 2)
@@ -2619,6 +2700,8 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
 
             if (ibPlaceShort)
             {
+                StaticVarSetText(svP + "Owner", StrategyCode, True);
+                ibOwner = StrategyCode;
                 ibOffset = ibATR * StpLmtAtrFactor;
 
                 if (EntryMethodParam == 2)
@@ -2764,10 +2847,18 @@ if (EnableAutoTrade AND Status("action") == actionIndicator)
             }
         }
 
+        if (ibPos == 0 AND ibDir == 0 AND ibLongOID == "" AND ibShortOID == ""
+            AND StaticVarGetText(svP + "Owner") == StrategyCode)
+        {
+            StaticVarSetText(svP + "Owner", "", True);
+            if (DebugTrace)
+                _TRACE("IB OWNER CLEARED " + ibTicker + " " + StrategyCode);
+        }
+
         // ================================================================
         // IN POSITION — manage exits and trailing stop
         // ================================================================
-        if ((ibPos != 0 OR ibDir != 0) AND NOT ibCloseSent)
+        if ((ibPos != 0 OR ibDir != 0) AND NOT ibCloseSent AND NOT ibForeign)
         {
             ibAbsPos = abs(ibPos);
             if (ibAbsPos <= 0)
